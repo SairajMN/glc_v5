@@ -19,11 +19,14 @@ def _providers(monkeypatch, keys: dict[str, str]):
 
 
 def test_numbered_keys_are_real_providers_and_logical_gemini_expands(monkeypatch):
-    pool = _providers(monkeypatch, {
-        "GEMINI_API_KEY_1": "one",
-        "GEMINI_API_KEY_2": "two",
-        "GEMINI_API_KEY_3": "three",
-    })
+    pool = _providers(
+        monkeypatch,
+        {
+            "GEMINI_API_KEY_1": "one",
+            "GEMINI_API_KEY_2": "two",
+            "GEMINI_API_KEY_3": "three",
+        },
+    )
     assert {name for name in pool if name.startswith("gemini_")} == {"gemini_1", "gemini_2", "gemini_3"}
     assert [pool[f"gemini_{i}"].api_key for i in (1, 2, 3)] == ["one", "two", "three"]
 

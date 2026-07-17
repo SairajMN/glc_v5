@@ -81,8 +81,10 @@ async def test_transcribe_default_when_stub_returns_501():
     # which the dispatcher translates into an STTError(status=501).
     class Stub(STTProvider):
         name = "groq_whisper"
+
         async def transcribe(self, audio, mime):
             raise NotImplementedError("assignment stub")
+
     register_stt("groq_whisper", Stub())
     with pytest.raises(STTError) as ei:
         await transcribe(b"\x00", "audio/wav", prefer="default")
@@ -163,8 +165,10 @@ async def test_synthesize_unknown_prefer_errors():
 async def test_synthesize_default_when_stub_returns_501():
     class Stub(TTSProvider):
         name = "kokoro"
+
         async def synthesize(self, text, voice_id=None):
             raise NotImplementedError("assignment stub")
+
     register_tts("kokoro", Stub())
     with pytest.raises(TTSError) as ei:
         await synthesize("hi", prefer="default")

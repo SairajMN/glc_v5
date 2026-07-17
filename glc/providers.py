@@ -1169,9 +1169,7 @@ def build_providers(cache_store):
     # Prefer the explicitly numbered pool.  A single legacy key remains a
     # one-member pool, so the rest of the router has exactly one model.
     gemini_pool = [
-        value
-        for value in (os.getenv(f"GEMINI_API_KEY_{i}") for i in range(1, MAX_GEMINI_KEYS + 1))
-        if value
+        value for value in (os.getenv(f"GEMINI_API_KEY_{i}") for i in range(1, MAX_GEMINI_KEYS + 1)) if value
     ]
     if not gemini_pool and (key := os.getenv("GEMINI_API_KEY")):
         gemini_pool = [key]

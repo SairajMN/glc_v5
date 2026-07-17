@@ -68,4 +68,5 @@ def fastapi_app():
     os.makedirs("/data/glc", exist_ok=True)
 
     from glc.main import app as web  # the real glc_v1 app, imported as-is
+
     return web
