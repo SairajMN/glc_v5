@@ -41,6 +41,7 @@ from glc.routes import channels as channels_route  # noqa: E402
 from glc.routes import chat as chat_route  # noqa: E402
 from glc.routes import control as control_route  # noqa: E402
 from glc.routes import economics as economics_route  # noqa: E402
+from glc.routes import observability as observability_route  # noqa: E402
 from glc.routes import speak as speak_route  # noqa: E402
 from glc.routes import transcribe as transcribe_route  # noqa: E402
 from glc.routing import Router, RouterPool  # noqa: E402
@@ -158,6 +159,10 @@ app.include_router(speak_route.router)
 app.include_router(control_route.router)
 app.include_router(channels_route.router)
 app.include_router(economics_route.router)
+app.include_router(observability_route.router)
+# A budget refusal writes no ledger row and opens no span. Observed here instead,
+# at the boundary, so `/v1/refusals` can show what the controller actually stopped.
+app.add_middleware(observability_route.RefusalRecorder)
 app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 
 

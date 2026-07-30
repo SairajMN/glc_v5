@@ -1,0 +1,37 @@
+# Jaeger for glc_v4 / S15Code.
+#
+#   docker compose -f docker-compose.observability.yml up -d
+#   open http://localhost:16686
+#
+# Jaeger v2 is an OpenTelemetry Collector distribution, so it receives OTLP
+# natively — 4317 for gRPC, 4318 for HTTP. There is no Jaeger-specific exporter to
+# install and no separate collector to run: point OTEL_EXPORTER_OTLP_ENDPOINT at
+# it and spans arrive. (The old jaeger-thrift ports are gone in v2; if you find a
+# tutorial using 6831/UDP, it is writing about v1.)
+#
+# Storage is in-memory, which is right for a session: it starts instantly, holds
+# plenty of traces, and forgets everything on restart so no run pollutes the next.
+#
+# Then, in the gateway's environment:
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+#   OTEL_SERVICE_NAME=glc-v4-gateway
+#   GLC_TRACE_UI=http://localhost:16686
+# and for S15Code:
+#   S15_OTEL_EXPORTER_ENDPOINT=http://localhost:4318/v1/traces
+#   S15_OTEL_SERVICE_NAME=s15code-agent
+#
+# No Docker on the machine? `scripts/jaeger_local.sh` runs the same thing from the
+# official standalone binary, on the same ports.
+
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:2.20.0
+    container_name: glc-jaeger
+    restart: unless-stopped
+    ports:
+      - "16686:16686"   # web UI and query API (/api/traces, /api/services)
+      - "4317:4317"     # OTLP/gRPC receiver
+      - "4318:4318"     # OTLP/HTTP receiver
+    environment:
+      # Jaeger v2 exposes the collector's own metrics; harmless and useful.
+      - METRICS_STORAGE_TYPE=prometheus

@@ -26,14 +26,24 @@ every collector sidecar already expects:
 
     OTEL_EXPORTER_OTLP_ENDPOINT   http://localhost:4318   -> export OTLP/HTTP
     OTEL_SERVICE_NAME             glc-gateway
+    OTEL_EXPORTER_OTLP_PROTOCOL   http/protobuf (default) | grpc
     GLC_OTEL_CONSOLE              1  -> also print spans as JSON to stdout
     GLC_OTEL_CAPTURE_CONTENT      1  -> attach prompt/completion text (PII)
     GLC_OTEL_ENABLED              0  -> disable entirely
+    GLC_OTEL_RECENT               how many finished traces to keep in memory (default 50)
+    GLC_TRACE_UI                  base URL of the trace UI to deep-link into
+
+The endpoint is the OTel *base* URL, as every collector sidecar expects:
+`http://localhost:4318` for OTLP/HTTP (the `/v1/traces` path is appended here, and
+not appended twice if you already wrote it), `localhost:4317` for gRPC. Jaeger v2
+receives OTLP natively on both, so no separate Jaeger exporter is needed.
 """
 
 from __future__ import annotations
 
 import os
+import re
+from collections import OrderedDict
 from contextlib import contextmanager
 from typing import Any
 
@@ -95,9 +105,51 @@ SPAN_EXECUTE_TOOL = "execute_tool"
 
 DEFAULT_SERVICE_NAME = "glc-gateway"
 
+#: Jaeger's own default UI port. Only used to *derive* a link when the operator
+#: has not named one; an unset, underivable UI means the dashboard says so
+#: rather than linking somewhere that does not exist.
+DEFAULT_TRACE_UI_PORT = 16686
+DEFAULT_RECENT_TRACES = 50
+
 
 def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def otlp_protocol() -> str:
+    """`grpc` or `http/protobuf`. Endpoint shape wins over the env var."""
+    declared = (
+        (os.getenv("OTEL_EXPORTER_OTLP_TRACES_PROTOCOL") or os.getenv("OTEL_EXPORTER_OTLP_PROTOCOL") or "")
+        .strip()
+        .lower()
+    )
+    return "grpc" if declared == "grpc" else "http/protobuf"
+
+
+def trace_ui_base() -> str | None:
+    """Where a human goes to look at a trace id.
+
+    `GLC_TRACE_UI` if the operator set one. Otherwise derived from the OTLP
+    endpoint host, because an OTLP receiver on `somehost:4318` is almost always
+    a Jaeger whose UI is on `somehost:16686`. Returns None when there is nothing
+    honest to link to.
+    """
+    explicit = (os.getenv("GLC_TRACE_UI") or os.getenv("GLC_JAEGER_UI") or "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    endpoint = (
+        os.getenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT") or os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or ""
+    ).strip()
+    if not endpoint:
+        return None
+    host = re.sub(r"^\w+://", "", endpoint).split("/", 1)[0].rsplit(":", 1)[0]
+    return f"http://{host}:{DEFAULT_TRACE_UI_PORT}" if host else None
+
+
+def trace_url(trace_id: str | None) -> str | None:
+    """A deep link to one trace, or None if no UI is known."""
+    base = trace_ui_base()
+    return f"{base}/trace/{trace_id}" if base and trace_id else None
 
 
 def capture_content() -> bool:
@@ -272,10 +324,50 @@ class Telemetry:
         #: Every span finished in this process, as plain dicts. Populated only
         #: when an in-memory exporter is requested (tests, proofs).
         self.captured: list[dict] = []
+        #: Bounded ring of the traces this process emitted. Present whenever the
+        #: tracer is active; the dashboard's trace list reads it.
+        self.recent: _RecentTraceExporter | None = None
 
     @property
     def active(self) -> bool:
         return self.tracer is not None
+
+    @property
+    def protocol_label(self) -> str:
+        """`grpc` when the endpoint is a bare host:port or the env says so."""
+        if self.endpoint and not self.endpoint.startswith(("http://", "https://")):
+            return "grpc"
+        return "grpc" if otlp_protocol() == "grpc" else "http"
+
+    @property
+    def traces_endpoint(self) -> str | None:
+        """The URL spans are actually POSTed to (HTTP) or dialled on (gRPC)."""
+        if not self.endpoint:
+            return None
+        base = self.endpoint.rstrip("/")
+        if self.protocol_label == "grpc":
+            return base
+        return base if base.endswith("/v1/traces") else f"{base}/v1/traces"
+
+    def _otlp_exporter(self):
+        """OTLP/HTTP or OTLP/gRPC. Jaeger v2 speaks both natively."""
+        if self.protocol_label == "grpc":
+            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import (
+                OTLPSpanExporter as GrpcSpanExporter,
+            )
+
+            return GrpcSpanExporter(endpoint=self.endpoint, insecure=True)
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+        return OTLPSpanExporter(endpoint=self.traces_endpoint)
+
+    # ── what the dashboard reads ───────────────────────────────────────────────
+
+    def recent_traces(self, limit: int = 25) -> list[dict]:
+        return self.recent.summaries(limit=limit) if self.recent else []
+
+    def trace_detail(self, trace_id: str) -> dict | None:
+        return self.recent.detail(trace_id) if self.recent else None
 
     def init(self, force: bool = False, in_memory: bool = False) -> Telemetry:
         if self._initialised and not force:
@@ -290,13 +382,13 @@ class Telemetry:
         in_memory = in_memory or _truthy(os.getenv("GLC_OTEL_IN_MEMORY"))
 
         if not telemetry_enabled():
-            self.tracer = None
+            self.tracer, self.recent = None, None
             self.exporters = ["disabled"]
             return self
         if not (self.endpoint or console or in_memory):
             # Nothing to export to. Stay a no-op rather than building a
             # provider that buffers spans forever.
-            self.tracer = None
+            self.tracer, self.recent = None, None
             self.exporters = ["none"]
             return self
         try:
@@ -323,20 +415,21 @@ class Telemetry:
         )
         if self.endpoint:
             try:
-                from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-
-                provider.add_span_processor(
-                    BatchSpanProcessor(OTLPSpanExporter(endpoint=f"{self.endpoint.rstrip('/')}/v1/traces"))
-                )
-                self.exporters.append(f"otlp-http:{self.endpoint}")
+                provider.add_span_processor(BatchSpanProcessor(self._otlp_exporter()))
+                self.exporters.append(f"otlp-{self.protocol_label}:{self.traces_endpoint}")
             except Exception as e:  # pragma: no cover - unreachable collector
-                self.exporters.append(f"otlp-http-failed:{type(e).__name__}")
+                self.exporters.append(f"otlp-{self.protocol_label}-failed:{type(e).__name__}")
         if console:
             provider.add_span_processor(SimpleSpanProcessor(ConsoleSpanExporter()))
             self.exporters.append("console")
         if in_memory:
             provider.add_span_processor(SimpleSpanProcessor(_ListExporter(self.captured)))
             self.exporters.append("in-memory")
+        # Always on when tracing is on: bounded, local, and what the dashboard reads.
+        self.recent = _RecentTraceExporter(
+            int(os.getenv("GLC_OTEL_RECENT", str(DEFAULT_RECENT_TRACES)) or DEFAULT_RECENT_TRACES)
+        )
+        provider.add_span_processor(SimpleSpanProcessor(self.recent))
 
         self.provider = provider
         # Never call trace.set_tracer_provider twice — OTel warns and ignores.
@@ -366,9 +459,13 @@ class Telemetry:
             "active": self.active,
             "service_name": self.service_name,
             "endpoint": self.endpoint,
+            "traces_endpoint": self.traces_endpoint,
+            "protocol": self.protocol_label if self.endpoint else None,
             "exporters": self.exporters,
             "capture_content": capture_content(),
             "captured_spans": len(self.captured),
+            "trace_ui": trace_ui_base(),
+            "recent_traces": len(self.recent.traces) if self.recent else 0,
         }
 
     @contextmanager
@@ -387,6 +484,103 @@ class Telemetry:
             except BaseException as e:
                 handle.record_exception(e)
                 raise
+
+
+def _span_as_dict(s: Any) -> dict:
+    """One finished SDK span, flattened for JSON."""
+    parent = getattr(s, "parent", None)
+    return {
+        "name": s.name,
+        "trace_id": f"{s.context.trace_id:032x}",
+        "span_id": f"{s.context.span_id:016x}",
+        "parent_span_id": f"{parent.span_id:016x}" if parent else None,
+        "start_time": s.start_time,
+        "end_time": s.end_time,
+        "duration_ns": (s.end_time or 0) - (s.start_time or 0),
+        "status": getattr(s.status, "status_code", None) and s.status.status_code.name,
+        "attributes": dict(s.attributes or {}),
+    }
+
+
+class _RecentTraceExporter:
+    """Keeps the last N traces in memory so the gateway can show its own work.
+
+    A trace backend is the right place to *query* traces and the wrong place to
+    be a hard dependency of the dashboard: with the collector down there would be
+    no trace list at all, and the panel would have to invent one. So the gateway
+    keeps a small bounded ring of what it just emitted — real spans, real ids, the
+    same ids Jaeger holds — and the dashboard deep-links into the UI for the
+    waterfall it cannot draw itself.
+    """
+
+    def __init__(self, limit: int = DEFAULT_RECENT_TRACES):
+        self.limit = max(1, int(limit))
+        self.traces: OrderedDict[str, dict] = OrderedDict()
+
+    def export(self, spans):  # noqa: D102
+        from opentelemetry.sdk.trace.export import SpanExportResult
+
+        for s in spans:
+            row = _span_as_dict(s)
+            trace = self.traces.get(row["trace_id"])
+            if trace is None:
+                trace = {"trace_id": row["trace_id"], "spans": []}
+                self.traces[row["trace_id"]] = trace
+                while len(self.traces) > self.limit:
+                    self.traces.popitem(last=False)
+            trace["spans"].append(row)
+            self.traces.move_to_end(row["trace_id"])
+        return SpanExportResult.SUCCESS
+
+    def summaries(self, limit: int | None = None) -> list[dict]:
+        """Newest first: one row per trace, with the numbers a table wants."""
+        rows = []
+        for trace in reversed(self.traces.values()):
+            spans = trace["spans"]
+            root = min(spans, key=lambda s: s["start_time"] or 0)
+            attrs: dict[str, Any] = {}
+            for s in spans:  # child attributes win; the provider call is the interesting one
+                attrs.update(s["attributes"])
+            start = min((s["start_time"] or 0) for s in spans)
+            end = max((s["end_time"] or 0) for s in spans)
+            rows.append(
+                {
+                    "trace_id": trace["trace_id"],
+                    "root_span": root["name"],
+                    "spans": len(spans),
+                    "started_at": start / 1e9 if start else None,
+                    "duration_ms": (end - start) / 1e6 if end and start else None,
+                    "status": "ERROR" if any(s["status"] == "ERROR" for s in spans) else "OK",
+                    "provider": attrs.get(GEN_AI_PROVIDER_NAME),
+                    "provider_instance": attrs.get("glc.provider.instance"),
+                    "model": attrs.get(GEN_AI_RESPONSE_MODEL) or attrs.get(GEN_AI_REQUEST_MODEL),
+                    "input_tokens": attrs.get(GEN_AI_USAGE_INPUT_TOKENS),
+                    "output_tokens": attrs.get(GEN_AI_USAGE_OUTPUT_TOKENS),
+                    "cost_usd": attrs.get(GLC_COST_USD),
+                    "role": attrs.get(GLC_ROUTING_ROLE),
+                    "tier": attrs.get(GLC_ROUTING_TIER),
+                    "cache_hit": attrs.get(GLC_CACHE_HIT),
+                    "budget_admitted": attrs.get(GLC_BUDGET_ADMITTED),
+                    "url": trace_url(trace["trace_id"]),
+                }
+            )
+            if limit and len(rows) >= limit:
+                break
+        return rows
+
+    def detail(self, trace_id: str) -> dict | None:
+        """Every span of one trace, parents resolvable — enough for a waterfall."""
+        trace = self.traces.get(trace_id)
+        if trace is None:
+            return None
+        spans = sorted(trace["spans"], key=lambda s: s["start_time"] or 0)
+        return {"trace_id": trace_id, "url": trace_url(trace_id), "spans": spans}
+
+    def shutdown(self):  # noqa: D102
+        return None
+
+    def force_flush(self, timeout_millis: int = 30000):  # noqa: D102, ARG002
+        return True
 
 
 class _ListExporter:
