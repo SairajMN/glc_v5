@@ -1,7 +1,7 @@
 [project]
-name = "glc-v3"
-version = "0.3.0"
-description = "GLC v3 — model gateway, multi-key routing, channels, voice and policy."
+name = "glc-v4"
+version = "0.4.0"
+description = "GLC v4 — glc_v3 plus agent economics: per-model pricing, principal attribution, a hard budget controller, OTel GenAI spans, role/cost routing and a semantic response cache."
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.110",
@@ -14,6 +14,13 @@ dependencies = [
     "websockets>=12.0",
     "twilio>=9.0",
     "modal>=1.5.1",
+    # v4 — OpenTelemetry. The GenAI semantic conventions moved to their own
+    # repo in June 2026 and still have no tagged release, so the attribute
+    # names live in glc/telemetry/otel.py as pinned constants rather than
+    # being imported from a package that may rename them.
+    "opentelemetry-api>=1.27",
+    "opentelemetry-sdk>=1.27",
+    "opentelemetry-exporter-otlp-proto-http>=1.27",
 ]
 
 [dependency-groups]
@@ -60,7 +67,10 @@ ignore = ["E501", "B008"]
 "glc/providers.py" = ["B023", "B904", "F841"]
 "glc/routes/chat.py" = ["B023", "B904", "F841"]
 "glc/embedders.py" = ["B023", "B904", "F841"]
-"glc/routing.py" = ["B023", "B904", "F841"]
+"glc/routing/core.py" = ["B023", "B904", "F841"]
+# v4: the compat shim deliberately reaches for a private helper in
+# economics.pricing so the v3 signature keeps its exact semantics.
+"glc/pricing.py" = ["SLF001"]
 # Stub adapters intentionally redefine narrow abstract types — quiet B027.
 "glc/channels/base.py" = ["B027"]
 
@@ -77,10 +87,10 @@ omit = [
     # to exercise meaningfully. The V9 test suite covers these.
     "glc/providers.py",
     "glc/embedders.py",
-    "glc/cache.py",
+    "glc/cache/gemini.py",
     "glc/llm_schemas.py",
     "glc/pricing.py",
-    "glc/routing.py",
+    "glc/routing/core.py",
     "glc/db.py",
     "glc/routes/chat.py",
     # Channel adapter stubs raise NotImplementedError — the green path

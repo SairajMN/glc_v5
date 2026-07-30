@@ -1,0 +1,150 @@
+# glc_v4 — routing policy.
+#
+# glc_v3 classified every prompt into TINY / LARGE / HUGE with a router LLM and
+# then looked the tier up in a hardcoded TIER_TO_ORDER dict. Three gaps this
+# file closes:
+#
+#   1. `role` was logged and then ignored. A "decision" call and a "perception"
+#      call with the same token count got the same model. Roles now carry tier
+#      floors and ceilings, so the role changes the model.
+#   2. HUGE returned 503 with a note about an unimplemented summariser. It now
+#      routes to whichever providers can actually hold the context.
+#   3. Provider order per tier was a fixed list. It can now be sorted by cost,
+#      by quality, or by a tradeoff dial between them, using the prices and
+#      quality scores in pricing.yaml.
+#
+# Adding a role, a tier, or a provider preference is an edit here and nothing
+# else. No Python knows the name of any role in this file.
+
+version: 1
+
+# ── Tiers ───────────────────────────────────────────────────────────────────
+# `order` is the base failover ring, preserved from glc_v3's TIER_TO_ORDER so
+# the default behaviour is unchanged. `min_ctx` filters candidates whose
+# max_ctx cannot hold the estimate — that is what makes HUGE routable instead
+# of a 503.
+tiers:
+  TINY:
+    order: [github, openrouter, groq, nvidia, cerebras, gemini, ollama]
+    description: short, simple, factual
+  LARGE:
+    order: [gemini, groq, nvidia, cerebras, github, openrouter, ollama]
+    description: dense or long-context work
+  HUGE:
+    order: [gemini, ollama, openrouter, nvidia, groq]
+    min_ctx: 8000
+    description: >
+      Above the 8k classifier boundary. v3 refused these outright; v4 keeps
+      only providers whose max_ctx actually covers the prompt (Gemini's 1M
+      window is the reason this tier is servable at all) and refuses with a
+      context-specific error if none qualify.
+
+# The escalation ladder, cheapest first. Also defines tier ordering for the
+# role floors and ceilings below, so there is one source of "which tier is
+# bigger".
+ladder: [TINY, LARGE, HUGE]
+
+# ── Roles ───────────────────────────────────────────────────────────────────
+# The role a caller declares (`auto_route: <role>`) now shapes the tier:
+#   default_tier  used when no classifier ran
+#   min_tier      floor — clamp UP to at least this tier
+#   max_tier      ceiling — clamp DOWN to at most this tier
+#   escalate      may this role spend more to retry
+#
+# Role names are free-form. Add one here and it works; the gateway validates
+# against this list and falls back to `default_role` for anything unknown.
+default_role: perception
+
+roles:
+  perception:
+    # Cheap, high-volume observation. Never worth a frontier model, so it is
+    # capped: a wrong tier classification cannot escalate spend here.
+    default_tier: TINY
+    max_tier: LARGE
+    escalate: true
+  memory:
+    # Retrieval and summarisation of stored context. Long inputs are normal,
+    # so no ceiling, but no floor either.
+    default_tier: TINY
+    escalate: true
+  decision:
+    # The step whose mistakes are expensive. Floored at LARGE: a TINY
+    # classification is overridden, which is the single clearest demonstration
+    # that role changes routing.
+    min_tier: LARGE
+    default_tier: LARGE
+    escalate: true
+  # Example of adding a role with no code change: a cheap classifier role that
+  # must never leave the smallest tier and must never escalate.
+  triage:
+    default_tier: TINY
+    max_tier: TINY
+    escalate: false
+
+# ── Cost / quality selection ────────────────────────────────────────────────
+# Reorders the tier's candidate ring. Rates and quality scores are read from
+# pricing.yaml, so a price change moves routing without touching this file.
+#
+#   objective: order | cost | quality | cost_quality
+#     order         keep the tier's declared ring (v3 behaviour)
+#     cost          cheapest blended $/Mtok first
+#     quality       highest quality score first
+#     cost_quality  score = tradeoff*quality - (1-tradeoff)*normalised_cost
+#
+#   tradeoff: 0.0 = pure cost, 1.0 = pure quality.
+selection:
+  objective: cost_quality
+  tradeoff: 0.5
+  #: Assumed output:input ratio when blending the two rates into one number.
+  output_weight: 0.35
+  #: Providers listed here are never reordered away from the front. Use for a
+  #: local model you want tried first because it is free.
+  pin_first: []
+
+# ── Cascade escalation (FrugalGPT-style) ────────────────────────────────────
+# Try the cheap tier; escalate only when the cheap answer looks bad. The point
+# of the confidence gate is that escalating on *every* call is strictly worse
+# than starting at the expensive tier — you pay for both.
+escalation:
+  enabled: true
+  max_escalations: 1
+  #: Answers scoring below this escalate one rung up the ladder.
+  confidence_threshold: 0.5
+  #: Which observations may trigger an escalation.
+  triggers: [empty_response, provider_failure, low_confidence, schema_failure]
+  #: Confidence is scored from structural signals only — no second LLM call,
+  #: because paying for a judge to check a cheap answer often costs more than
+  #: the expensive answer would have.
+  confidence:
+    empty_response: 0.0
+    schema_failure: 0.1
+    #: stop_reason == max_tokens. Scored just ABOVE the threshold on purpose:
+    #: truncation almost always means the caller under-budgeted max_tokens, and
+    #: a bigger model will hit the same cap. Escalating here would pay twice for
+    #: the same truncated answer.
+    truncated_response: 0.55
+    #: Shorter than this many characters counts as a non-answer. DISABLED (0)
+    #: on purpose. It was set to 8 during the build and immediately caused the
+    #: failure this session is about: "Paris" — a correct one-word answer to a
+    #: one-word question — scored 0.3, escalated to a bigger model, and made
+    #: cost-per-resolved-task worse while cost-per-call looked unchanged.
+    #: Emptiness is evidence that an answer is bad. Brevity is not. Set this
+    #: only for a task class whose answers are known to be long.
+    min_response_chars: 0
+    short_response: 0.3
+    #: Case-insensitive substrings that mark a hedge or refusal. EMPTY by
+    #: default: a marker list is a use-case-specific guess, and a wrong one
+    #: escalates good answers. Populate it for your own task class.
+    hedge_markers: []
+    hedge_penalty: 0.35
+    default: 1.0
+
+# ── Budget interaction ──────────────────────────────────────────────────────
+# The budget controller is the authority on refusal; this is only a preference.
+# When `prefer_affordable` is on, a tier whose cheapest provider is projected
+# to breach the remaining allowance is deprioritised, so a run near its ceiling
+# drifts down the ladder rather than slamming into a 402.
+budget:
+  prefer_affordable: true
+  #: Refuse to escalate when the escalated tier would breach the allowance.
+  block_escalation_on_breach: true

@@ -35,6 +35,32 @@ def _isolated_glc_state(monkeypatch, tmp_path):
     import glc.audit.store as _a
 
     _a._singleton = None
+
+    # `glc.db.DB_PATH` is bound from the environment at *import* time, so
+    # setting GLC_GATEWAY_DB above only isolates the ledger for a module that
+    # has not been imported yet — which, once anything has touched glc.db, is
+    # nothing. Without this the whole suite writes into the developer's real
+    # ~/.glc/gateway.sqlite. Patch the bound value too.
+    import glc.db as _db
+
+    monkeypatch.setattr(_db, "DB_PATH", str(tmp_path / "gateway.sqlite"))
+
+    # v4 singletons hold config read against the previous CONFIG_DIR.
+    import glc.economics.budget as _b
+
+    _b.reset_controller()
+    import glc.economics.meter as _m
+
+    _m.reset_meter()
+    import glc.economics.pricing as _pr
+
+    _pr.reload_pricing()
+    import glc.routing.policy as _rp
+
+    _rp.reset_policy()
+    import glc.telemetry.otel as _o
+
+    _o.reset_telemetry()
     yield
 
 

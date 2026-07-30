@@ -1,0 +1,254 @@
+# glc_v4 — per-MODEL pricing.
+#
+# v3 priced per *provider*, which is wrong the moment a provider serves more
+# than one model (every provider here does). This table is keyed by model, with
+# the provider table kept only as a last-resort fallback so an unpriced model
+# reports exactly what v3 reported for it.
+#
+# Everything in this file is data. Adding a model is a new entry here and no
+# Python edit anywhere.
+#
+# Resolution order for (provider, model):
+#   1. models[<model>]                      exact string
+#   2. models[<model with vendor/ prefix stripped>]
+#   3. first matching patterns[] glob, in file order
+#   4. providers[<provider base name>]      v3 behaviour
+#   5. unpriced_default                     (0/0 — never invent a price)
+#
+# Units: USD per 1,000,000 tokens.
+# Multipliers are applied to the *input* rate for cached tokens, and to both
+# rates for batch. They are data because the mechanics differ per vendor:
+# Anthropic charges 1.25x/2.0x to write a cache and 0.1x to read it; OpenAI's
+# implicit cache is a free write and a 0.1x read; Gemini explicit caching is a
+# 0.25x read plus a storage fee this table does not model.
+
+version: 1
+
+defaults:
+  currency: USD
+  unit: usd_per_mtok
+  cache_read_multiplier: 1.0 # no discount unless the model declares one
+  cache_write_multiplier: 1.0
+  batch_multiplier: 1.0
+
+unpriced_default:
+  input: 0.0
+  output: 0.0
+
+# ── Models actually reachable from this gateway's default .env ───────────────
+models:
+  # Google AI Studio. Free under the course's AI-Studio quota; list rates are
+  # recorded so a paid deployment reports real dollars.
+  gemini-3.1-flash-lite:
+    provider: gemini
+    input: 0.25
+    output: 1.50
+    cache_read_multiplier: 0.25
+    cache_write_multiplier: 1.0
+    batch_multiplier: 0.5
+    quality: 0.62
+  gemini-3.1-flash:
+    provider: gemini
+    input: 0.50
+    output: 3.00
+    cache_read_multiplier: 0.25
+    batch_multiplier: 0.5
+    quality: 0.70
+  gemini-3.1-pro:
+    provider: gemini
+    input: 2.00
+    output: 12.00
+    cache_read_multiplier: 0.25
+    batch_multiplier: 0.5
+    quality: 0.78
+  gemini-2.5-flash:
+    provider: gemini
+    input: 0.30
+    output: 2.50
+    cache_read_multiplier: 0.25
+    batch_multiplier: 0.5
+    quality: 0.58
+
+  # Groq
+  openai/gpt-oss-120b:
+    provider: groq
+    input: 0.15
+    output: 0.75
+    cache_read_multiplier: 0.1
+    quality: 0.60
+  llama-3.3-70b-versatile:
+    provider: groq
+    input: 0.59
+    output: 0.79
+    quality: 0.48
+
+  # Cerebras
+  zai-glm-4.7:
+    provider: cerebras
+    input: 0.50
+    output: 0.50
+    quality: 0.61
+  llama3.1-8b:
+    provider: cerebras
+    input: 0.10
+    output: 0.10
+    quality: 0.30
+
+  # NVIDIA NIM — free build tier for the course.
+  deepseek-ai/deepseek-v4-pro:
+    provider: nvidia
+    input: 0.0
+    output: 0.0
+    quality: 0.70
+  deepseek-ai/deepseek-v3.2:
+    provider: nvidia
+    input: 0.0
+    output: 0.0
+    quality: 0.66
+  nvidia/llama-3.1-nemotron-nano-8b-v1:
+    provider: nvidia
+    input: 0.0
+    output: 0.0
+    quality: 0.28
+
+  # GitHub Models — free quota; the rates below are what the same models cost
+  # on Azure OpenAI once the quota is gone.
+  openai/gpt-4.1:
+    provider: github
+    input: 2.00
+    output: 8.00
+    cache_read_multiplier: 0.25
+    quality: 0.55
+  openai/gpt-4.1-mini:
+    provider: github
+    input: 0.40
+    output: 1.60
+    cache_read_multiplier: 0.25
+    quality: 0.52
+
+  # Local via Ollama — never charged, but priced at 0 explicitly so the report
+  # says "free because local" rather than "unpriced".
+  gemma4:31b:
+    provider: ollama
+    input: 0.0
+    output: 0.0
+    quality: 0.42
+  microsoft/Phi-4-mini-instruct:
+    provider: github
+    input: 0.0
+    output: 0.0
+    quality: 0.26
+
+# ── Reference frontier rates (July 2026 list prices) ────────────────────────
+# Not reachable from the default .env, but priced so a deployment that adds an
+# Anthropic/OpenAI provider gets correct dollars with zero code change, and so
+# the cost-per-task lecture has real numbers to compare against.
+  claude-haiku-4.5:
+    provider: anthropic
+    input: 1.00
+    output: 5.00
+    cache_read_multiplier: 0.1
+    cache_write_multiplier: 1.25
+    batch_multiplier: 0.5
+    quality: 0.50
+  claude-sonnet-5:
+    provider: anthropic
+    input: 2.00
+    output: 10.00
+    cache_read_multiplier: 0.1
+    cache_write_multiplier: 1.25
+    batch_multiplier: 0.5
+    quality: 0.57
+  claude-opus-5:
+    provider: anthropic
+    input: 5.00
+    output: 25.00
+    cache_read_multiplier: 0.1
+    cache_write_multiplier: 1.25
+    batch_multiplier: 0.5
+    quality: 0.61
+  gpt-5.6-luna:
+    provider: openai
+    input: 1.00
+    output: 6.00
+    cache_read_multiplier: 0.1
+    batch_multiplier: 0.5
+    quality: 0.50
+  gpt-5.6-terra:
+    provider: openai
+    input: 2.50
+    output: 15.00
+    cache_read_multiplier: 0.1
+    batch_multiplier: 0.5
+    quality: 0.55
+  gpt-5.6-sol:
+    provider: openai
+    input: 5.00
+    output: 30.00
+    cache_read_multiplier: 0.1
+    batch_multiplier: 0.5
+    quality: 0.59
+
+# ── Glob fallbacks, matched in order ────────────────────────────────────────
+# A new point release (gemini-3.2-flash-lite) is priced sanely before anyone
+# gets round to adding it above.
+patterns:
+  - match: "*:free"
+    input: 0.0
+    output: 0.0
+    quality: 0.35
+  - match: "gemini-*-flash-lite*"
+    input: 0.25
+    output: 1.50
+    cache_read_multiplier: 0.25
+    batch_multiplier: 0.5
+    quality: 0.60
+  - match: "gemini-*-flash*"
+    input: 0.50
+    output: 3.00
+    cache_read_multiplier: 0.25
+    batch_multiplier: 0.5
+    quality: 0.68
+  - match: "gemini-*-pro*"
+    input: 2.00
+    output: 12.00
+    cache_read_multiplier: 0.25
+    batch_multiplier: 0.5
+    quality: 0.76
+  - match: "claude-*"
+    input: 2.00
+    output: 10.00
+    cache_read_multiplier: 0.1
+    cache_write_multiplier: 1.25
+    batch_multiplier: 0.5
+    quality: 0.57
+  - match: "*nemotron*"
+    input: 0.0
+    output: 0.0
+    quality: 0.40
+
+# ── v3 per-provider table, kept verbatim as the backward-compatible floor ───
+# Reached only when nothing above matched. These are the exact numbers
+# glc_v3's pricing.PRICING_USD_PER_MTOK carried.
+providers:
+  gemini:
+    input: 0.0
+    output: 0.0
+  nvidia:
+    input: 0.0
+    output: 0.0
+  groq:
+    input: 0.15
+    output: 0.75
+  cerebras:
+    input: 0.50
+    output: 0.50
+  openrouter:
+    input: 0.0
+    output: 0.0
+  github:
+    input: 0.0
+    output: 0.0
+  ollama:
+    input: 0.0
+    output: 0.0

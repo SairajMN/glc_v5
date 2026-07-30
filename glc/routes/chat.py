@@ -6,6 +6,23 @@ pipeline. Bare imports were rewritten as package-relative imports; the
 V9 fixes (json_object hint injection, Gemini cooldown handling, day
 rollover, default URL inheritance) are preserved verbatim. Do not
 regress them — tests in test_v9_compat.py assert behaviour shape.
+
+V4 additions inside `/v1/chat`, in the order they run:
+
+1. **semantic cache** — on a hit, return the stored response and never
+   contact a provider,
+2. **routing policy** — apply the role's tier floor/ceiling to whatever the
+   classifier said, then order candidates by cost/quality,
+3. **budget admission** — project the worst-case cost and refuse with a 402
+   envelope before the provider is contacted,
+4. **OTel span** — one `chat` span per provider call, carrying
+   `gen_ai.usage.*` and the computed cost,
+5. **meter** — one priced ledger row per call, attributed to all five
+   principal dimensions,
+6. **cascade** — on a low-confidence answer, escalate one tier and retry.
+
+Every one of those is inert unless configured, so a glc_v4 with the shipped
+config files behaves exactly like glc_v3.
 """
 
 from __future__ import annotations
@@ -24,6 +41,8 @@ from jsonschema import Draft202012Validator, ValidationError
 
 from glc import db
 from glc import providers as P
+from glc.economics import budget as _budget
+from glc.economics import meter as _meter
 from glc.llm_schemas import (
     BatchChatRequest,
     ChatRequest,
@@ -36,6 +55,8 @@ from glc.llm_schemas import (
     VisionRequest,
 )
 from glc.routing import DEFAULT_ROUTER_ORDER, LIMITS, SHORTCUTS
+from glc.routing import policy as _policy
+from glc.telemetry import otel as _otel
 
 DEFAULT_ORDER = ["ollama", "gemini", "nvidia", "groq", "cerebras", "openrouter", "github"]
 ORDER = [x.strip() for x in os.getenv("LLM_ORDER", ",".join(DEFAULT_ORDER)).split(",") if x.strip()]
@@ -51,10 +72,28 @@ if _AGENT_ROUTING_PATH.exists():
     except Exception as e:  # pragma: no cover
         print(f"[glc] failed to parse agent_routing.yaml: {e!r}")
 
+# V3's hardcoded tier ring. Kept as the module-level name because callers and
+# `/v1/routers` read it, but it is now the *fallback* — `routing.yaml` is
+# authoritative and `_tier_order()` prefers it. The two agree by construction:
+# routing.yaml's TINY and LARGE rings are these lists verbatim.
 TIER_TO_ORDER = {
     "TINY": ["github", "openrouter", "groq", "nvidia", "cerebras", "gemini", "ollama"],
     "LARGE": ["gemini", "groq", "nvidia", "cerebras", "github", "openrouter", "ollama"],
 }
+
+
+def _routing_policy() -> _policy.RoutingPolicy | None:
+    """The loaded routing policy, or None if routing.yaml is unusable.
+
+    A broken routing.yaml must not take the gateway down — it falls back to
+    v3's TIER_TO_ORDER and says so on the console.
+    """
+    try:
+        return _policy.load_policy()
+    except Exception as e:  # pragma: no cover - config error path
+        print(f"[glc] routing.yaml unusable, falling back to v3 TIER_TO_ORDER: {e!r}")
+        return None
+
 
 ROUTER_SAMPLE_HEAD = 400
 ROUTER_SAMPLE_TAIL = 400
@@ -341,6 +380,68 @@ def _validate_structured(text: str, schema: dict):
     return obj
 
 
+# ─────────────────────── v4 helpers (economics / policy) ──────────────────────
+
+
+def _tier_candidates(pol, tier: str, rtr, est_tokens: int, tradeoff: float | None = None):
+    """Ordered provider instances for a tier, plus per-candidate rejections.
+
+    Prefers `routing.yaml`. Falls back to v3's TIER_TO_ORDER when the policy is
+    unavailable or does not declare the tier.
+
+    Note on a v3 bug this fixes: v3 filtered the tier ring with
+    `p in rtr.providers`, but Gemini is registered as `gemini_1..N` (one entry
+    per key), so the literal name `gemini` never matched and Gemini was silently
+    dropped from every auto-routed call — including the LARGE tier where it is
+    listed first. The policy expands base names to live instances, so it is
+    reachable again, which is also what makes the HUGE tier servable (Gemini's
+    1M-token window is the only one wide enough).
+    """
+    if pol is not None and tier in pol.tiers:
+        return pol.order_for(tier, rtr.providers, limits=LIMITS, est_tokens=est_tokens, tradeoff=tradeoff)
+    ring = TIER_TO_ORDER.get(tier) or []
+    return rtr.expand(ring), []
+
+
+def _cache_request_fields(req: ChatRequest, system_blocks) -> dict:
+    """The fields that must match exactly before two prompts are comparable."""
+    return {
+        "model": req.model,
+        "provider": req.provider,
+        "system": system_blocks if isinstance(system_blocks, str) else json.dumps(system_blocks, default=str),
+        "tools": json.dumps([t.model_dump() for t in req.tools], default=str) if req.tools else None,
+        "response_format": (req.response_format.model_dump() if req.response_format else None),
+        "temperature": req.temperature,
+        "max_tokens": req.max_tokens,
+        "auto_route": req.auto_route,
+    }
+
+
+def _trace_ids(span) -> dict | None:
+    tid = span.attributes.get("trace_id")
+    if tid:
+        return {"trace_id": tid, "span_id": span.attributes.get("span_id")}
+    try:
+        from opentelemetry import trace as _t
+
+        ctx = _t.get_current_span().get_span_context()
+        if ctx and ctx.trace_id:
+            return {"trace_id": f"{ctx.trace_id:032x}", "span_id": f"{ctx.span_id:016x}"}
+    except Exception:  # pragma: no cover
+        pass
+    return None
+
+
+def _budget_refusal(admission) -> HTTPException:
+    """A 402 with numbers in it.
+
+    402 Payment Required is the honest status: the request was well-formed and
+    permitted, and the only thing wrong with it is that it costs more than the
+    principal has left. Nothing was sent to a provider, so nothing was billed.
+    """
+    return HTTPException(402, admission.envelope())
+
+
 # ─────────────────────────── routes ───────────────────────────
 
 
@@ -349,6 +450,13 @@ async def chat(req: ChatRequest, request: Request):
     state = request.app.state
     rtr = state.router
     router_pool = state.router_pool
+    pol = _routing_policy()
+    ctl = getattr(state, "budget", None) or _budget.get_controller()
+    telemetry = getattr(state, "telemetry", None) or _otel.get_telemetry()
+    meter = getattr(state, "meter", None) or _meter.get_meter()
+    scache = getattr(state, "semantic_cache", None)
+    principal = _meter.Principal.from_request(req)
+
     messages = _normalize_messages(req)
     if any(P._content_has_image(m.get("content")) for m in messages):
         messages = await _resolve_image_urls(messages)
@@ -362,6 +470,7 @@ async def chat(req: ChatRequest, request: Request):
         for m in messages
     )
     est = _est_tokens(messages, system_blocks, req.max_tokens)
+    est_input = max(0, est - req.max_tokens)
     explicit_override = bool(req.provider)
     required_caps = _required_caps(req)
 
@@ -371,22 +480,114 @@ async def chat(req: ChatRequest, request: Request):
             req.provider = pinned
             explicit_override = True
 
+    # ── 1. semantic cache: a hit means no provider is contacted at all ───────
+    cache_info: dict | None = None
+    cache_fields = _cache_request_fields(req, system_blocks)
+    if scache is not None:
+        lookup = await scache.lookup(
+            prompt_text,
+            cache_fields,
+            principal=principal,
+            opt_in=req.semantic_cache,
+            temperature=req.temperature,
+            has_tools=bool(req.tools),
+            stream=bool(req.stream),
+        )
+        cache_info = lookup.as_dict()
+        if lookup.hit and lookup.response:
+            t0 = time.time()
+            with telemetry.span(_otel.SPAN_CHAT) as span:
+                span.set_request(
+                    provider=lookup.provider or "(cache)",
+                    model=lookup.model,
+                    max_tokens=req.max_tokens,
+                    temperature=req.temperature,
+                )
+                # Zero usage is the point: the tokens the provider would have
+                # charged for are recorded as *saved*, not as spent.
+                span.set_usage(input_tokens=0, output_tokens=0, response_model=lookup.model)
+                span.set_principal(principal)
+                span.set_many(
+                    {
+                        _otel.GLC_CACHE_HIT: True,
+                        _otel.GLC_CACHE_KIND: "semantic",
+                        _otel.GLC_CACHE_SIMILARITY: round(lookup.similarity, 6),
+                        _otel.GLC_CACHE_TOKENS_SAVED: lookup.tokens_saved,
+                        _otel.GLC_CACHE_USD_SAVED: lookup.usd_saved,
+                        _otel.GLC_COST_USD: 0.0,
+                        _otel.GLC_ROUTING_ROLE: req.auto_route,
+                    }
+                )
+                latency = int((time.time() - t0) * 1000)
+                meter.record(
+                    provider=lookup.provider or "(cache)",
+                    model=lookup.model or "",
+                    principal=principal,
+                    usage=_meter.Usage(),
+                    latency_ms=latency,
+                    status="ok",
+                    prompt_chars=len(prompt_text),
+                    response_chars=len(str(lookup.response.get("text") or "")),
+                    override=req.provider,
+                    call_role="worker",
+                    role=req.auto_route,
+                    cache_hit=True,
+                    cache_kind="semantic",
+                    tokens_saved=lookup.tokens_saved,
+                    usd_saved=lookup.usd_saved,
+                )
+                out = dict(lookup.response)
+                out["latency_ms"] = latency
+                out["cache"] = cache_info
+                out["cost"] = {"total_usd": 0.0, "price_source": "semantic-cache-hit"}
+                out["trace"] = _trace_ids(span)
+                return out
+
+    # ── 2. tier classification, then the role policy on top of it ───────────
     retries = 0
     router_decision: RouterDecision | None = None
+    tier: str | None = None
+    tier_path: list[str] = []
+    policy_rejections: list[dict] = []
+
     if req.auto_route and not req.provider:
         router_decision = await _classify_tier(req, req.auto_route, router_pool, prompt_text)
-        if router_decision.tier == "HUGE":
+        classified = router_decision.tier
+        if pol is not None:
+            decision = pol.tier_for(req.auto_route, classified)
+            tier = decision.tier
+            router_decision.role = decision.role
+            router_decision.tier = decision.tier
+            router_decision.classified_tier = classified
+            router_decision.policy_clamped = decision.clamped
+            router_decision.policy_reason = decision.reason
+        else:
+            tier = classified
+            router_decision.classified_tier = classified
+        tier_path = [tier]
+        candidates, policy_rejections = _tier_candidates(
+            pol, tier, rtr, est_input, tradeoff=req.cost_quality_tradeoff
+        )
+        if not candidates:
+            # v3 raised a blanket 503 for HUGE pointing at an unimplemented
+            # summariser. v4 only refuses when no configured provider can hold
+            # the context, and says which limit was the problem.
             raise HTTPException(
                 503,
                 {
-                    "error": "input exceeds 8000 tokens",
-                    "hint": "Use the Summarizer Agent (V7, not yet implemented). "
-                    "For now, chunk the input or set provider=g explicitly to try Gemini anyway.",
+                    "error": "no provider can serve this tier",
+                    "tier": tier,
+                    "estimated_input_tokens": est_input,
+                    "rejected": policy_rejections,
+                    "hint": (
+                        "Every candidate for this tier was filtered out — usually because the "
+                        "prompt exceeds each provider's max_ctx. Widen tiers."
+                        f"{tier}.order in routing.yaml, chunk the input, or pin a "
+                        "long-context provider explicitly."
+                    ),
                     "router_decision": router_decision.model_dump(),
                 },
             )
-        tier_order = TIER_TO_ORDER[router_decision.tier]
-        candidates = [p for p in tier_order if p in rtr.providers]
     else:
         candidates = rtr.candidates(req.provider) if req.provider else rtr.candidates()
 
@@ -396,8 +597,11 @@ async def chat(req: ChatRequest, request: Request):
             f"unknown provider '{req.provider}'. Try one of: {list(rtr.providers)} or shortcuts {list(SHORTCUTS)}",
         )
 
-    all_attempts: list[dict] = []
+    all_attempts: list[dict] = list(policy_rejections)
     last_err = None
+    escalations = 0
+    budget_info: dict | None = None
+    last_refusal = None
 
     if explicit_override and len(candidates) == 1:
         deadline = time.time() + 30
@@ -410,231 +614,385 @@ async def chat(req: ChatRequest, request: Request):
                 break
             await _asyncio.sleep(min(cd + 0.05, 5))
 
-    for _ in range(len(candidates) + 1):
-        name, atts = rtr.pick(est, candidates, required_caps=required_caps)
-        all_attempts.extend(atts)
-        if name is None:
-            break
-        provider = rtr.providers[name]
-        t0 = time.time()
-        rtr.state[name].record(0)
-        try:
-            if req.stream:
+    # ── 3. the candidate ring, wrapped in the cascade loop ──────────────────
+    # The inner `for` is v3's failover ring, unchanged. The outer `while` is the
+    # cascade: an escalation sets `escalated` and re-enters the ring with the
+    # next tier's candidates. Any other exit leaves the loop for good, so a
+    # cascade cannot spin.
+    while True:
+        escalated = False
+        for _ in range(len(candidates) + 1):
+            name, atts = rtr.pick(est, candidates, required_caps=required_caps)
+            all_attempts.extend(atts)
+            if name is None:
+                break
+            provider = rtr.providers[name]
+            model_for_call = req.model or provider.model
 
-                async def gen():
-                    try:
-                        agg = []
-                        async for chunk in provider.stream(
-                            messages,
-                            max_tokens=req.max_tokens,
-                            temperature=req.temperature,
-                            model=req.model,
-                            tools=req.tools,
-                            tool_choice=req.tool_choice,
-                            reasoning=req.reasoning,
-                            response_format=req.response_format,
-                            system_blocks=system_blocks,
-                            cache_system=bool(req.cache_system),
-                        ):
-                            agg.append(chunk)
-                            if chunk.startswith("[[TOOL_CALL_DELTA]]"):
-                                yield f"data: {json.dumps({'provider': name, 'tool_call_delta': chunk[len('[[TOOL_CALL_DELTA]] ') :]})}\n\n"
-                            else:
-                                yield f"data: {json.dumps({'provider': name, 'delta': chunk})}\n\n"
-                        text = "".join(agg)
-                        latency = int((time.time() - t0) * 1000)
-                        db.log_call(
-                            provider=name,
-                            model=req.model or provider.model,
-                            latency_ms=latency,
-                            status="ok",
-                            prompt_chars=len(prompt_text),
-                            response_chars=len(text),
-                            override=req.provider,
-                            attempted=_attempts_str(all_attempts),
-                            agent=req.agent,
-                            session=req.session,
-                            retries=retries,
-                        )
-                        yield f"data: {json.dumps({'done': True, 'provider': name})}\n\n"
-                    except Exception as e:
-                        db.log_call(
-                            provider=name,
-                            model=req.model or provider.model,
-                            status="error",
-                            error=str(e)[:500],
-                            latency_ms=int((time.time() - t0) * 1000),
-                            prompt_chars=len(prompt_text),
-                            override=req.provider,
-                            attempted=_attempts_str(all_attempts),
-                            agent=req.agent,
-                            session=req.session,
-                            retries=retries,
-                        )
-                        yield f"data: {json.dumps({'error': str(e)[:300]})}\n\n"
+            # ── budget admission. Runs BEFORE the provider is contacted, on a
+            # worst-case projection, for the model that is actually about to be
+            # called. A refusal here costs nothing because nothing was sent.
+            admission = ctl.admit(
+                principal,
+                ctl.project(name, model_for_call, est_input, req.max_tokens, batch=bool(req.batch)),
+            )
+            if not admission.allowed:
+                last_refusal = admission
+                budget_info = admission.as_dict()
+                all_attempts.append({"provider": name, "reason": f"refused:budget {admission.reason}"})
+                # Try a cheaper candidate rather than failing the whole request:
+                # the next provider in the ring may be affordable. If none are,
+                # the 402 below fires.
+                candidates = [c for c in candidates if c != name]
+                continue
+            budget_info = admission.as_dict()
 
-                return StreamingResponse(gen(), media_type="text/event-stream")
-
+            t0 = time.time()
+            rtr.state[name].record(0)
+            span_cm = telemetry.span(_otel.SPAN_CHAT)
+            span = span_cm.__enter__()
+            span.set_request(
+                provider=name,
+                model=model_for_call,
+                max_tokens=req.max_tokens,
+                temperature=req.temperature,
+            )
+            span.set_principal(principal)
+            span.set_admission(admission)
+            span.set_many(
+                {
+                    _otel.GLC_ROUTING_ROLE: req.auto_route,
+                    _otel.GLC_ROUTING_TIER: tier,
+                    _otel.GLC_ROUTING_TIER_CLASSIFIED: (
+                        router_decision.classified_tier if router_decision else None
+                    ),
+                    _otel.GLC_ROUTING_ESCALATIONS: escalations,
+                    _otel.GLC_CACHE_HIT: False,
+                }
+            )
+            span.set_content(messages=messages)
             try:
-                result = await provider.chat(
-                    messages,
-                    max_tokens=req.max_tokens,
-                    temperature=req.temperature,
-                    model=req.model,
-                    tools=req.tools,
-                    tool_choice=req.tool_choice,
-                    reasoning=req.reasoning,
-                    response_format=req.response_format,
-                    system_blocks=system_blocks,
-                    cache_system=bool(req.cache_system),
-                )
-            except (P.ProviderError, Exception) as transient:
-                status = getattr(transient, "status", None)
-                msg = str(transient).lower()
-                retryable = (status is not None and 500 <= status < 600) or status == 408 or "timeout" in msg
-                if not retryable:
-                    raise
-                await _asyncio.sleep(min(2.0, 0.5 * (2**retries)))
-                retries += 1
-                result = await provider.chat(
-                    messages,
-                    max_tokens=req.max_tokens,
-                    temperature=req.temperature,
-                    model=req.model,
-                    tools=req.tools,
-                    tool_choice=req.tool_choice,
-                    reasoning=req.reasoning,
-                    response_format=req.response_format,
-                    system_blocks=system_blocks,
-                    cache_system=bool(req.cache_system),
-                )
-            latency = int((time.time() - t0) * 1000)
+                if req.stream:
 
-            parsed = None
-            if req.response_format and req.response_format.schema_ and not result["tool_calls"]:
+                    async def gen():
+                        try:
+                            agg = []
+                            async for chunk in provider.stream(
+                                messages,
+                                max_tokens=req.max_tokens,
+                                temperature=req.temperature,
+                                model=req.model,
+                                tools=req.tools,
+                                tool_choice=req.tool_choice,
+                                reasoning=req.reasoning,
+                                response_format=req.response_format,
+                                system_blocks=system_blocks,
+                                cache_system=bool(req.cache_system),
+                            ):
+                                agg.append(chunk)
+                                if chunk.startswith("[[TOOL_CALL_DELTA]]"):
+                                    yield f"data: {json.dumps({'provider': name, 'tool_call_delta': chunk[len('[[TOOL_CALL_DELTA]] ') :]})}\n\n"
+                                else:
+                                    yield f"data: {json.dumps({'provider': name, 'delta': chunk})}\n\n"
+                            text = "".join(agg)
+                            latency = int((time.time() - t0) * 1000)
+                            meter.record(
+                                provider=name,
+                                model=req.model or provider.model,
+                                principal=principal,
+                                usage=_meter.Usage(),
+                                latency_ms=latency,
+                                status="ok",
+                                prompt_chars=len(prompt_text),
+                                response_chars=len(text),
+                                override=req.provider,
+                                attempted=_attempts_str(all_attempts),
+                                retries=retries,
+                                role=req.auto_route,
+                                tier=tier,
+                            )
+                            yield f"data: {json.dumps({'done': True, 'provider': name})}\n\n"
+                        except Exception as e:
+                            meter.record(
+                                provider=name,
+                                model=req.model or provider.model,
+                                principal=principal,
+                                usage=_meter.Usage(),
+                                status="error",
+                                error=str(e)[:500],
+                                latency_ms=int((time.time() - t0) * 1000),
+                                prompt_chars=len(prompt_text),
+                                override=req.provider,
+                                attempted=_attempts_str(all_attempts),
+                                retries=retries,
+                                role=req.auto_route,
+                                tier=tier,
+                            )
+                            yield f"data: {json.dumps({'error': str(e)[:300]})}\n\n"
+
+                    span_cm.__exit__(None, None, None)
+                    return StreamingResponse(gen(), media_type="text/event-stream")
+
                 try:
-                    parsed = _validate_structured(result["text"], req.response_format.schema_)
-                except (ValueError, ValidationError) as ve:
-                    fix_msgs = list(messages) + [
-                        {"role": "assistant", "content": result["text"]},
-                        {
-                            "role": "user",
-                            "content": f"Your previous reply did not match the required JSON schema: {ve}. Reply ONLY with valid JSON conforming to the schema.",
-                        },
-                    ]
                     result = await provider.chat(
-                        fix_msgs,
+                        messages,
                         max_tokens=req.max_tokens,
-                        temperature=0,
+                        temperature=req.temperature,
                         model=req.model,
+                        tools=req.tools,
+                        tool_choice=req.tool_choice,
+                        reasoning=req.reasoning,
                         response_format=req.response_format,
                         system_blocks=system_blocks,
                         cache_system=bool(req.cache_system),
                     )
+                except (P.ProviderError, Exception) as transient:
+                    status = getattr(transient, "status", None)
+                    msg = str(transient).lower()
+                    retryable = (
+                        (status is not None and 500 <= status < 600) or status == 408 or "timeout" in msg
+                    )
+                    if not retryable:
+                        raise
+                    await _asyncio.sleep(min(2.0, 0.5 * (2**retries)))
+                    retries += 1
+                    result = await provider.chat(
+                        messages,
+                        max_tokens=req.max_tokens,
+                        temperature=req.temperature,
+                        model=req.model,
+                        tools=req.tools,
+                        tool_choice=req.tool_choice,
+                        reasoning=req.reasoning,
+                        response_format=req.response_format,
+                        system_blocks=system_blocks,
+                        cache_system=bool(req.cache_system),
+                    )
+                latency = int((time.time() - t0) * 1000)
+
+                parsed = None
+                schema_failed = False
+                if req.response_format and req.response_format.schema_ and not result["tool_calls"]:
                     try:
                         parsed = _validate_structured(result["text"], req.response_format.schema_)
-                    except (ValueError, ValidationError) as ve2:
-                        raise HTTPException(503, f"structured output failed validation: {ve2}")
+                    except (ValueError, ValidationError) as ve:
+                        fix_msgs = list(messages) + [
+                            {"role": "assistant", "content": result["text"]},
+                            {
+                                "role": "user",
+                                "content": f"Your previous reply did not match the required JSON schema: {ve}. Reply ONLY with valid JSON conforming to the schema.",
+                            },
+                        ]
+                        result = await provider.chat(
+                            fix_msgs,
+                            max_tokens=req.max_tokens,
+                            temperature=0,
+                            model=req.model,
+                            response_format=req.response_format,
+                            system_blocks=system_blocks,
+                            cache_system=bool(req.cache_system),
+                        )
+                        try:
+                            parsed = _validate_structured(result["text"], req.response_format.schema_)
+                        except (ValueError, ValidationError) as ve2:
+                            # v3 raised 503 here unconditionally. v4 gives the
+                            # cascade a chance to escalate first — a schema
+                            # failure is the cleanest low-confidence signal
+                            # there is — and only 503s if it cannot.
+                            schema_failed = True
+                            if pol is None or not _may_escalate(
+                                pol, req, tier, escalations, schema_failed=True
+                            ):
+                                raise HTTPException(503, f"structured output failed validation: {ve2}")
 
-            tokens = (result["input_tokens"] or 0) + (result["output_tokens"] or 0)
-            rtr.state[name].tokens_today += tokens
-            rtr.state[name].tokens_minute.append((time.time(), tokens))
-            if router_decision is not None:
-                router_decision.chosen_worker_provider = name
-                router_decision.chosen_worker_model = result["model"]
-            db.log_call(
-                provider=name,
-                model=result["model"],
-                input_tokens=result["input_tokens"],
-                output_tokens=result["output_tokens"],
-                cache_create_tokens=result["cache_creation_input_tokens"],
-                cache_read_tokens=result["cache_read_input_tokens"],
-                latency_ms=latency,
-                status="ok",
-                prompt_chars=len(prompt_text),
-                response_chars=len(result["text"]),
-                override=req.provider,
-                attempted=_attempts_str(all_attempts),
-                tool_calls=len(result["tool_calls"]),
-                reasoning_applied=result["reasoning_applied"],
-                tool_dialect=result["tool_call_dialect"],
-                call_role="worker",
-                router_decision=router_decision.tier if router_decision else None,
-                agent=req.agent,
-                session=req.session,
-                retries=retries,
-            )
-            return ChatResponse(
-                provider=name,
-                model=result["model"],
-                text=result["text"],
-                tool_calls=[ToolCall(**tc) for tc in result["tool_calls"]],
-                stop_reason=result["stop_reason"],
-                input_tokens=result["input_tokens"],
-                output_tokens=result["output_tokens"],
-                cache_creation_input_tokens=result["cache_creation_input_tokens"],
-                cache_read_input_tokens=result["cache_read_input_tokens"],
-                latency_ms=latency,
-                tool_call_dialect=result["tool_call_dialect"],
-                reasoning_applied=result["reasoning_applied"],
-                parsed=parsed,
-                attempted=all_attempts,
-                router_decision=router_decision,
-                retries=retries,
-            ).model_dump()
-        except P.ProviderError as e:
-            last_err = str(e)
-            secs, reason = _backoff_for(e, has_model_override=bool(req.model))
-            if secs > 0:
-                rtr.state[name].mark_unavailable(secs, reason)
-            db.log_call(
-                provider=name,
-                model=req.model or provider.model,
-                status="error",
-                error=str(e)[:500],
-                latency_ms=int((time.time() - t0) * 1000),
-                prompt_chars=len(prompt_text),
-                override=req.provider,
-                attempted=_attempts_str(all_attempts),
-                agent=req.agent,
-                session=req.session,
-                retries=retries,
-            )
-            tag = f"failed: {str(e)[:100]}"
-            if secs > 0:
-                tag += f" → backoff {secs:.0f}s ({reason})"
-            all_attempts.append({"provider": name, "reason": tag})
-            if explicit_override or not getattr(e, "retryable", True):
-                raise HTTPException(502, f"{name} failed: {e}")
-            candidates = [c for c in candidates if c != name]
-            continue
-        except HTTPException:
-            raise
-        except Exception as e:
-            last_err = str(e)
-            secs, reason = _backoff_for(e, has_model_override=bool(req.model))
-            if secs > 0:
-                rtr.state[name].mark_unavailable(secs, reason)
-            db.log_call(
-                provider=name,
-                model=req.model or provider.model,
-                status="error",
-                error=str(e)[:500],
-                latency_ms=int((time.time() - t0) * 1000),
-                prompt_chars=len(prompt_text),
-                override=req.provider,
-                attempted=_attempts_str(all_attempts),
-                agent=req.agent,
-                session=req.session,
-                retries=retries,
-            )
-            all_attempts.append({"provider": name, "reason": f"exception: {str(e)[:120]}"})
-            if explicit_override:
-                raise HTTPException(502, f"{name} failed: {e}")
-            candidates = [c for c in candidates if c != name]
-            continue
+                tokens = (result["input_tokens"] or 0) + (result["output_tokens"] or 0)
+                rtr.state[name].tokens_today += tokens
+                rtr.state[name].tokens_minute.append((time.time(), tokens))
+                if router_decision is not None:
+                    router_decision.chosen_worker_provider = name
+                    router_decision.chosen_worker_model = result["model"]
+
+                usage = _meter.Usage.from_provider_result(result)
+                record = meter.record(
+                    provider=name,
+                    model=result["model"],
+                    principal=principal,
+                    usage=usage,
+                    batch=bool(req.batch),
+                    latency_ms=latency,
+                    status="ok",
+                    prompt_chars=len(prompt_text),
+                    response_chars=len(result["text"]),
+                    override=req.provider,
+                    attempted=_attempts_str(all_attempts),
+                    tool_calls=len(result["tool_calls"]),
+                    reasoning_applied=result["reasoning_applied"],
+                    tool_dialect=result["tool_call_dialect"],
+                    call_role="worker",
+                    router_decision=router_decision.tier if router_decision else None,
+                    retries=retries,
+                    role=req.auto_route,
+                    tier=tier,
+                    escalations=escalations,
+                )
+                span.set_usage(
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    cache_read_tokens=usage.cache_read_tokens,
+                    cache_write_tokens=usage.cache_write_tokens,
+                    response_model=result["model"],
+                    finish_reason=result["stop_reason"],
+                )
+                span.set_cost(record.cost_breakdown)
+                span.set(_otel.GLC_LEDGER_ROW_ID, record.row_id)
+                span.set_content(completion=result["text"])
+
+                # ── cascade: was this answer good enough to keep? ───────────
+                confidence = None
+                if pol is not None:
+                    assessed = pol.assess({**result, "schema_failed": schema_failed})
+                    confidence = assessed.score
+                    span.set(_otel.GLC_ROUTING_CONFIDENCE, round(assessed.score, 4))
+                    do_escalate, why = pol.should_escalate(req.auto_route, tier or "", assessed, escalations)
+                    if do_escalate and req.escalate is not False and tier:
+                        nxt = pol.next_tier(tier)
+                        span.set("glc.routing.escalation_reason", why)
+                        span_cm.__exit__(None, None, None)
+                        all_attempts.append({"provider": name, "reason": f"escalated: {why}"})
+                        escalations += 1
+                        tier = nxt
+                        tier_path.append(tier)
+                        candidates, extra = _tier_candidates(
+                            pol, tier, rtr, est_input, tradeoff=req.cost_quality_tradeoff
+                        )
+                        all_attempts.extend(extra)
+                        if router_decision is not None:
+                            router_decision.tier = tier
+                            router_decision.escalations = escalations
+                            router_decision.tier_path = list(tier_path)
+                        escalated = True
+                        break  # leave the inner ring, re-enter with the new tier
+
+                if router_decision is not None:
+                    router_decision.escalations = escalations
+                    router_decision.tier_path = list(tier_path)
+                    router_decision.confidence = confidence
+
+                response = ChatResponse(
+                    provider=name,
+                    model=result["model"],
+                    text=result["text"],
+                    tool_calls=[ToolCall(**tc) for tc in result["tool_calls"]],
+                    stop_reason=result["stop_reason"],
+                    input_tokens=result["input_tokens"],
+                    output_tokens=result["output_tokens"],
+                    cache_creation_input_tokens=result["cache_creation_input_tokens"],
+                    cache_read_input_tokens=result["cache_read_input_tokens"],
+                    latency_ms=latency,
+                    tool_call_dialect=result["tool_call_dialect"],
+                    reasoning_applied=result["reasoning_applied"],
+                    parsed=parsed,
+                    attempted=all_attempts,
+                    router_decision=router_decision,
+                    retries=retries,
+                    cost=record.cost_breakdown,
+                    budget=budget_info,
+                    cache=cache_info,
+                    trace=_trace_ids(span),
+                ).model_dump()
+                span_cm.__exit__(None, None, None)
+
+                if scache is not None and cache_info and not cache_info.get("skipped_reason"):
+                    await scache.store(
+                        prompt_text,
+                        cache_fields,
+                        response,
+                        provider=name,
+                        model=result["model"],
+                        input_tokens=usage.input_tokens,
+                        output_tokens=usage.output_tokens,
+                        usd=record.usd,
+                        principal=principal,
+                    )
+                return response
+            except P.ProviderError as e:
+                last_err = str(e)
+                span.set_error(str(e)[:300])
+                span_cm.__exit__(type(e), e, e.__traceback__)
+                secs, reason = _backoff_for(e, has_model_override=bool(req.model))
+                if secs > 0:
+                    rtr.state[name].mark_unavailable(secs, reason)
+                meter.record(
+                    provider=name,
+                    model=req.model or provider.model,
+                    principal=principal,
+                    usage=_meter.Usage(),
+                    status="error",
+                    error=str(e)[:500],
+                    latency_ms=int((time.time() - t0) * 1000),
+                    prompt_chars=len(prompt_text),
+                    override=req.provider,
+                    attempted=_attempts_str(all_attempts),
+                    retries=retries,
+                    role=req.auto_route,
+                    tier=tier,
+                )
+                tag = f"failed: {str(e)[:100]}"
+                if secs > 0:
+                    tag += f" → backoff {secs:.0f}s ({reason})"
+                all_attempts.append({"provider": name, "reason": tag})
+                if explicit_override or not getattr(e, "retryable", True):
+                    raise HTTPException(502, f"{name} failed: {e}")
+                candidates = [c for c in candidates if c != name]
+                continue
+            except HTTPException:
+                span_cm.__exit__(None, None, None)
+                raise
+            except Exception as e:
+                last_err = str(e)
+                span.set_error(str(e)[:300])
+                span_cm.__exit__(type(e), e, e.__traceback__)
+                secs, reason = _backoff_for(e, has_model_override=bool(req.model))
+                if secs > 0:
+                    rtr.state[name].mark_unavailable(secs, reason)
+                meter.record(
+                    provider=name,
+                    model=req.model or provider.model,
+                    principal=principal,
+                    usage=_meter.Usage(),
+                    status="error",
+                    error=str(e)[:500],
+                    latency_ms=int((time.time() - t0) * 1000),
+                    prompt_chars=len(prompt_text),
+                    override=req.provider,
+                    attempted=_attempts_str(all_attempts),
+                    retries=retries,
+                    role=req.auto_route,
+                    tier=tier,
+                )
+                all_attempts.append({"provider": name, "reason": f"exception: {str(e)[:120]}"})
+                if explicit_override:
+                    raise HTTPException(502, f"{name} failed: {e}")
+                candidates = [c for c in candidates if c != name]
+                continue
+        if not (escalated and candidates):
+            break
+
+    # Every candidate was refused on cost, and none was even attempted. That is
+    # a budget answer, not an availability answer, so it gets the 402 envelope.
+    if last_refusal is not None and last_err is None:
+        raise _budget_refusal(last_refusal)
 
     raise HTTPException(503, f"all providers unavailable. attempts: {all_attempts}. last_error: {last_err}")
+
+
+def _may_escalate(pol, req: ChatRequest, tier: str | None, escalations: int, schema_failed: bool) -> bool:
+    """Cheap pre-check used inside the schema-repair path."""
+    if req.escalate is False or not tier:
+        return False
+    assessed = _policy.ConfidenceAssessment(0.1, [_policy.TRIGGER_SCHEMA] if schema_failed else [])
+    ok, _ = pol.should_escalate(req.auto_route, tier, assessed, escalations)
+    return ok
 
 
 @router.post("/v1/chat/batch")
@@ -817,15 +1175,21 @@ async def status(request: Request):
 @router.get("/v1/routers")
 async def routers(request: Request):
     rp = request.app.state.router_pool
-    return {
+    pol = _routing_policy()
+    out = {
         "order": rp.order,
         "providers": list(rp.providers.keys()),
         "models": {n: p.model for n, p in rp.providers.items()},
         "live": rp.all_status(),
         "today": db.aggregate(call_role="router"),
         "limits": {k: LIMITS[k] for k in rp.providers},
-        "tier_to_order": TIER_TO_ORDER,
+        # v3 key, unchanged shape. routing.yaml's rings supersede it when the
+        # policy loads; the fallback dict is reported when it does not.
+        "tier_to_order": pol.tier_to_order() if pol else TIER_TO_ORDER,
     }
+    if pol is not None:
+        out["routing_policy"] = pol.describe()
+    return out
 
 
 @router.get("/v1/calls")

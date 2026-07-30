@@ -1,6 +1,12 @@
-"""FastAPI app for glc_v1. Port 8111 by default. V9 routes are mounted
-as-is (S9 Browser / S10 Computer-Use clients work unchanged); the new
-S11 surfaces (transcribe, speak, channels WS, control) sit alongside.
+"""FastAPI app for glc_v4. Port 8111 by default. V9 routes are mounted
+as-is (S9 Browser / S10 Computer-Use clients work unchanged); the
+S11 surfaces (transcribe, speak, channels WS, control) sit alongside, and
+v4 adds the economics surface (budgets, principal cost, cache stats).
+
+v4 boot additions, all fail-soft: a broken pricing.yaml, an unreachable OTLP
+collector or a missing embedder must never stop the gateway from serving
+`/v1/chat`. Each is caught, reported on the console, and the corresponding
+feature stays off.
 """
 
 from __future__ import annotations
@@ -25,14 +31,21 @@ from glc import embedders as E  # noqa: E402
 from glc import providers as P  # noqa: E402
 from glc.audit import init_store as init_audit  # noqa: E402
 from glc.cache import GeminiCache  # noqa: E402
+from glc.cache.semantic import build_semantic_cache  # noqa: E402
 from glc.config import get_or_create_install_token  # noqa: E402
+from glc.economics import budget as budget_mod  # noqa: E402
+from glc.economics import meter as meter_mod  # noqa: E402
+from glc.economics import pricing as pricing_mod  # noqa: E402
 from glc.policy import reload_engine  # noqa: E402
 from glc.routes import channels as channels_route  # noqa: E402
 from glc.routes import chat as chat_route  # noqa: E402
 from glc.routes import control as control_route  # noqa: E402
+from glc.routes import economics as economics_route  # noqa: E402
 from glc.routes import speak as speak_route  # noqa: E402
 from glc.routes import transcribe as transcribe_route  # noqa: E402
 from glc.routing import Router, RouterPool  # noqa: E402
+from glc.routing import policy as routing_policy  # noqa: E402
+from glc.telemetry import otel as otel_mod  # noqa: E402
 
 PORT = int(os.getenv("GLC_PORT", "8111"))
 
@@ -58,6 +71,60 @@ def _install_sighup_reload() -> None:
         pass
 
 
+def _boot_economics(app: FastAPI) -> None:
+    """Load the v4 config-driven layers. Each failure is isolated: a bad
+    pricing.yaml costs you dollar reports, not the gateway."""
+    app.state.config_errors = {}
+
+    # Reload rather than load: the singletons may be holding a table read
+    # against a previous GLC_CONFIG_DIR (tests, or a SIGHUP).
+    try:
+        app.state.pricing = pricing_mod.reload_pricing()
+        meter_mod.reset_meter()
+        app.state.meter = meter_mod.get_meter()
+    except Exception as e:
+        app.state.config_errors["pricing.yaml"] = repr(e)
+        print(f"[glc] pricing.yaml unusable — dollars will report as 0: {e!r}")
+        app.state.meter = meter_mod.get_meter()
+
+    try:
+        budget_mod.init_store()
+        app.state.budget = budget_mod.reload_controller()
+        armed = [p.principal for p in app.state.budget.policies()]
+        if armed:
+            print(f"[glc] budget controller armed for {armed}")
+    except Exception as e:
+        # A malformed budgets.yaml must NOT silently mean "no budget". The
+        # gateway boots, but the error is recorded and surfaced on
+        # /v1/budget so nobody mistakes a broken ceiling for a generous one.
+        app.state.config_errors["budgets.yaml"] = repr(e)
+        app.state.budget = None
+        print(f"[glc] budgets.yaml unusable — budget enforcement is OFF: {e!r}")
+
+    try:
+        app.state.routing_policy = routing_policy.reload_policy()
+    except Exception as e:
+        app.state.config_errors["routing.yaml"] = repr(e)
+        app.state.routing_policy = None
+        print(f"[glc] routing.yaml unusable — falling back to v3 TIER_TO_ORDER: {e!r}")
+
+    try:
+        otel_mod.reset_telemetry()
+        app.state.telemetry = otel_mod.init_telemetry()
+        print(f"[glc] telemetry: {app.state.telemetry.describe()}")
+    except Exception as e:
+        app.state.config_errors["telemetry"] = repr(e)
+        app.state.telemetry = otel_mod.Telemetry()
+        print(f"[glc] telemetry init failed — spans are a no-op: {e!r}")
+
+    try:
+        app.state.semantic_cache = build_semantic_cache(app.state.embedders)
+    except Exception as e:
+        app.state.config_errors["cache.yaml"] = repr(e)
+        app.state.semantic_cache = None
+        print(f"[glc] semantic cache unavailable: {e!r}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init()
@@ -70,18 +137,27 @@ async def lifespan(app: FastAPI):
     app.state.router_providers = P.build_router_providers()
     app.state.router_pool = RouterPool(app.state.router_providers, chat_route.ROUTER_ORDER)
     app.state.embedders, app.state.embed_order = E.build_embedders()
+    _boot_economics(app)
     app.state.started_at = time.time()
     app.state.registered_channels = []
     yield
+    t = getattr(app.state, "telemetry", None)
+    if t is not None:
+        t.flush()
+        t.shutdown()
 
 
-app = FastAPI(title="GLC v3 — Gateway for Models, Routing and Channels", lifespan=lifespan)
+app = FastAPI(
+    title="GLC v4 — Gateway for Models, Routing, Channels and Agent Economics",
+    lifespan=lifespan,
+)
 
 app.include_router(chat_route.router)
 app.include_router(transcribe_route.router)
 app.include_router(speak_route.router)
 app.include_router(control_route.router)
 app.include_router(channels_route.router)
+app.include_router(economics_route.router)
 app.mount("/static", StaticFiles(directory=str(STATIC)), name="static")
 
 

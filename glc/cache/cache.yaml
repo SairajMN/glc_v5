@@ -1,0 +1,59 @@
+# glc_v4 — response / semantic cache.
+#
+# The distinction that matters: prompt caching (glc/cache/gemini.py, plus the
+# implicit prefix caching every OpenAI-compatible provider does) discounts the
+# *input* tokens of a call that still happens. A semantic cache answers from a
+# previous response and the call does not happen at all — so the saving is 100%
+# of the tokens, not 90% of the input tokens.
+#
+# The cost of that: matching is fuzzy. Two prompts 0.93 cosine apart can want
+# different answers, and near the threshold you serve a confidently wrong
+# response. That is why the threshold is high, configurable, and why the cache
+# ships opt-in rather than on.
+
+version: 1
+
+semantic:
+  #: Master switch. When false the module is inert and never embeds anything.
+  enabled: true
+
+  #: Whether requests are cached by default. Left false deliberately: a
+  #: gateway that starts silently returning stored answers to every caller is
+  #: a surprise, and the embedding call itself costs something. Callers opt in
+  #: per request with `semantic_cache: true`; flip this to true to invert that.
+  default_on: false
+
+  #: Cosine similarity required for a hit. The 2026 production range is
+  #: 0.92-0.97; below ~0.92 wrong-answer collisions become common.
+  threshold: 0.95
+
+  #: Entry lifetime. 0 = never expires.
+  ttl_seconds: 3600
+
+  #: Evict oldest beyond this count. 0 = unbounded.
+  max_entries: 5000
+
+  #: Similarity is only consulted among entries whose namespace matches
+  #: exactly. These are the request fields that must be byte-identical before
+  #: two prompts are even comparable — a cached answer from a different model,
+  #: system prompt or tool set is not the same answer.
+  namespace_fields: [model, system, tools, response_format, temperature]
+
+  #: Never serve a cached answer to a request that is not deterministic-ish.
+  #: A high temperature means the caller asked for variety.
+  max_temperature: 0.3
+
+  #: Requests carrying tool definitions are not cached: a tool call's value is
+  #: in executing it now, against current state.
+  skip_when_tools: true
+
+  #: Skip caching for streaming responses (nothing to replay from the ledger).
+  skip_when_stream: true
+
+  #: Cache scope. Which principal dimensions must match for a hit to be
+  #: allowed. Empty list = the cache is shared across all callers.
+  #: Set to e.g. [tenant] to stop one tenant's answers reaching another's.
+  scope_dimensions: [tenant]
+
+  #: Embedding task type passed to the embedder.
+  task_type: retrieval_query

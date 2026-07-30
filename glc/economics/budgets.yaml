@@ -1,0 +1,72 @@
+# glc_v4 — spend budgets.
+#
+# This is the spend kill-switch. Read the enforcement model before editing:
+#
+#   * A call is admitted only if EVERY policy matching its principal has room
+#     for the call's *projected worst-case* cost. One breach refuses the call.
+#   * Refusal is an HTTP 402 with a structured envelope. The gateway never
+#     silently truncates, downgrades, or drops a request to fit a budget —
+#     the caller is told, with numbers, and decides what to do.
+#   * Spend is read back out of the `calls` ledger, so it survives restarts and
+#     cannot drift from what was actually billed.
+#   * Enforcement is code, not a prompt. TALE (arXiv 2026) named the reason:
+#     "token elasticity" — models blow straight past a budget stated in their
+#     context. A budget an agent can talk itself out of is not a budget.
+#
+# Ships EMPTY. A fresh glc_v4 behaves exactly like glc_v3: nothing is refused.
+# Add a policy below (or POST /v1/budget at runtime) to arm the controller.
+
+version: 1
+
+defaults:
+  enabled: true # master switch for the whole controller
+  period: day # minute | hour | day | month | lifetime
+  currency: USD
+  on_breach: refuse # `refuse` is the only hard behaviour; see below
+  include_errors: true # a failed call still burned tokens, so it still counts
+  #: unmatched principals are unlimited. Set a `principal: "tenant:*"` policy
+  #: to make the default deny-ish for a whole dimension.
+  unmatched: allow
+
+projection:
+  # How much a call *could* cost, computed before it runs.
+  #   max_tokens -> charge output at the caller's full max_tokens (worst case)
+  #   ratio      -> charge output at output_ratio x estimated input tokens
+  output_tokens: max_tokens
+  output_ratio: 1.0
+  #: multiply the projection by this before comparing to the remaining
+  #: allowance. >1 reserves headroom for provider token-count disagreement.
+  safety_factor: 1.0
+  #: floor on the projection, so a $0-priced model still trips a call-count
+  #: ceiling if one is set. 0 disables.
+  min_usd: 0.0
+
+# Per-principal ceilings. `principal` is "<dimension>:<value>"; dimensions are
+# tenant, project, user, agent, session. `*` is a glob over the value, so
+# "tenant:*" means "each tenant, separately" — not "all tenants pooled".
+#
+# Most specific match wins per dimension: an exact value beats a glob. All
+# matched policies (one per dimension) are checked, and the tightest refusal
+# is reported.
+#
+# Example — copy, uncomment, edit. No Python changes needed for any of it.
+#
+# policies:
+#   - principal: "tenant:*"
+#     limit_usd: 100.0
+#     period: month
+#   - principal: "user:*"
+#     limit_usd: 5.0
+#     period: day
+#   - principal: "agent:summarizer"
+#     limit_usd: 0.25
+#     period: hour
+#   - principal: "session:*"
+#     limit_usd: 0.50           # the denial-of-wallet circuit breaker
+#     period: lifetime
+policies: []
+
+# Optional: warn (in the response, in the span, in the log) before refusing.
+# Purely advisory — it changes no routing decision.
+alerts:
+  warn_at_fraction: 0.8
