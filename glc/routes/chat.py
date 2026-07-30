@@ -280,25 +280,59 @@ def _est_tokens(messages, system_blocks, max_tokens):
     return chars // 4 + max_tokens
 
 
+#: Default cooldown per failure class, in seconds — v3's numbers verbatim except
+#: `timeout`. routing.yaml's `backoff:` block overrides any of them by name, so
+#: benching a flaky provider for longer is a config edit and not a code change.
+#:
+#: `timeout` was 10s, and the measured consequence was ugly: NVIDIA's configured
+#: model answers nothing and the HTTP client waits its full 180s, so a 10s bench
+#: means the very next request pays 180s again. A dead endpoint has to stay
+#: benched for much longer than it takes to notice it is dead.
+BACKOFF_DEFAULTS = {
+    "queue": 15,
+    "rpm": 60,
+    "rpd": 3600,
+    "rate_limited": 30,
+    "upstream_5xx": 20,
+    "timeout": 600,
+    "auth": 600,
+}
+
+
+def _backoff_seconds(kind: str) -> float:
+    """Cooldown for a failure class, from routing.yaml when it says so."""
+    default = BACKOFF_DEFAULTS.get(kind, 0)
+    pol = _routing_policy()
+    cfg = getattr(pol, "backoff", None) or {}
+    try:
+        return float(cfg.get(kind, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
 def _backoff_for(err: Exception, has_model_override: bool = False):
-    msg = str(err).lower()
+    # The class name is part of the haystack on purpose. An httpx ReadTimeout
+    # stringifies to the EMPTY STRING, so matching str(err) alone matched nothing
+    # and returned a zero cooldown — the provider that had just burned 180s came
+    # straight back as a candidate on the next request.
+    msg = f"{type(err).__name__} {err}".lower()
     status = getattr(err, "status", None)
     if status == 429:
         if "queue" in msg:
-            return 15, "server queue full"
+            return _backoff_seconds("queue"), "server queue full"
         if "quota" in msg or "rpm" in msg or "per minute" in msg:
-            return 60, "RPM quota burned"
+            return _backoff_seconds("rpm"), "RPM quota burned"
         if "rpd" in msg or "per day" in msg or "daily" in msg:
-            return 3600, "RPD quota burned"
-        return 30, "rate limited"
+            return _backoff_seconds("rpd"), "RPD quota burned"
+        return _backoff_seconds("rate_limited"), "rate limited"
     if status and 500 <= status < 600:
-        return 20, f"upstream {status}"
-    if status == 408 or "timeout" in msg:
-        return 10, "timeout"
+        return _backoff_seconds("upstream_5xx"), f"upstream {status}"
+    if status == 408 or "timeout" in msg or "timedout" in msg:
+        return _backoff_seconds("timeout"), "timeout"
     if status in (401, 403):
         if has_model_override:
             return 0, ""
-        return 600, "auth error"
+        return _backoff_seconds("auth"), "auth error"
     if status == 404 and has_model_override:
         return 0, ""
     return 0, ""

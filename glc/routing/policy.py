@@ -59,6 +59,19 @@ class TierSpec:
     order: list[str] = field(default_factory=list)
     min_ctx: int = 0
     description: str = ""
+    #: When true, only the providers named in `order` may serve this tier.
+    #: Without it `order_for` appends every other configured provider as a
+    #: last-resort tail, which is right for a failover ring and wrong for a
+    #: capability rung: a rung that can silently be served by a different
+    #: model is not a rung. It is also the only way to keep a quarantined
+    #: provider out of the tail.
+    strict: bool = False
+    #: Per-tier override of `selection.objective` / `selection.tradeoff`. A
+    #: rung that names one model wants `order`, whatever the global dial says.
+    objective: str | None = None
+    tradeoff: float | None = None
+    #: Which ladder this tier belongs to. Set from `ladder` / `ladders`.
+    ladder: str = ""
 
 
 @dataclass(frozen=True)
@@ -126,6 +139,39 @@ class RoutingPolicy:
         if unknown:
             raise RoutingConfigError(f"routing.yaml: ladder names undeclared tiers {unknown}")
         self.ladder: list[str] = list(ladder)
+        #: Named secondary ladders. `ladder` above stays the classifier's
+        #: TINY/LARGE/HUGE ring for backward compatibility; a second, named
+        #: ladder can order a different set of tiers by cost. `rank`,
+        #: `next_tier` and `prev_tier` resolve within whichever ladder a tier
+        #: belongs to, so one gateway can hold both without either seeing the
+        #: other's rungs.
+        self.ladders: dict[str, list[str]] = {"default": list(self.ladder)}
+        for lname, names in (data.get("ladders") or {}).items():
+            names = list(names or [])
+            unknown_l = [t for t in names if t not in tiers_raw]
+            if unknown_l:
+                raise RoutingConfigError(f"routing.yaml: ladders.{lname} names undeclared tiers {unknown_l}")
+            if lname == "default":
+                raise RoutingConfigError("routing.yaml: `ladders.default` is reserved for `ladder`")
+            self.ladders[str(lname)] = names
+        #: tier name -> the ladder it lives on. A tier on two ladders is a
+        #: config error, because "one rung up" would be ambiguous.
+        self._ladder_of: dict[str, str] = {}
+        for lname, names in self.ladders.items():
+            for t in names:
+                if t in self._ladder_of and self._ladder_of[t] != lname:
+                    raise RoutingConfigError(
+                        f"routing.yaml: tier {t!r} is on two ladders "
+                        f"({self._ladder_of[t]!r} and {lname!r}); escalation would be ambiguous"
+                    )
+                self._ladder_of[t] = lname
+        #: Providers config says must not be used, with the reason why. They are
+        #: dropped from every tier and reported as a rejection, so a broken
+        #: endpoint is benched by editing this file rather than by editing code.
+        self.unavailable: dict[str, str] = {
+            str(k): str(v) for k, v in (data.get("unavailable") or {}).items()
+        }
+        self.backoff: dict = data.get("backoff") or {}
         self.tiers: dict[str, TierSpec] = {}
         for name, spec in tiers_raw.items():
             spec = spec or {}
@@ -134,6 +180,10 @@ class RoutingPolicy:
                 order=list(spec.get("order") or []),
                 min_ctx=int(spec.get("min_ctx") or 0),
                 description=str(spec.get("description") or ""),
+                strict=bool(spec.get("strict", False)),
+                objective=(str(spec["objective"]) if spec.get("objective") else None),
+                tradeoff=(float(spec["tradeoff"]) if spec.get("tradeoff") is not None else None),
+                ladder=self._ladder_of.get(name, ""),
             )
         self.default_role = str(data.get("default_role") or (list(data.get("roles") or {}) or ["default"])[0])
         self.roles: dict[str, RoleSpec] = {}
@@ -165,9 +215,15 @@ class RoutingPolicy:
 
     # ── tier ordering helpers ────────────────────────────────────────────────
 
+    def ladder_of(self, tier: str) -> list[str]:
+        """The ladder `tier` lives on — the classifier ladder unless a named
+        ladder in `ladders:` claims it."""
+        return self.ladders.get(self._ladder_of.get(tier, "default"), self.ladder)
+
     def rank(self, tier: str) -> int:
-        """Position on the ladder. Unknown tiers sort last."""
-        return self.ladder.index(tier) if tier in self.ladder else len(self.ladder)
+        """Position on the tier's own ladder. Unknown tiers sort last."""
+        rungs = self.ladder_of(tier)
+        return rungs.index(tier) if tier in rungs else len(rungs)
 
     def role_spec(self, role: str | None) -> RoleSpec:
         """Resolve a role name, falling back to the configured default rather
@@ -191,8 +247,25 @@ class RoutingPolicy:
         it returns the classified tier unchanged, which is exactly v3.
         """
         spec = self.role_spec(role)
-        tier = classified_tier if classified_tier in self.tiers else spec.default_tier
-        reason = "classifier" if classified_tier in self.tiers else f"role default ({spec.name})"
+        role_ladder = self._ladder_of.get(spec.default_tier, "default")
+        tier: str | None = None
+        reason = ""
+        if classified_tier in self.tiers:
+            if self._ladder_of.get(classified_tier, "default") == role_ladder:
+                tier, reason = classified_tier, "classifier"
+            else:
+                # The classifier only ever names rungs of its own ladder. A role
+                # whose rungs are a different ladder still wants the classifier's
+                # verdict, so carry it across by POSITION: "smallest of three"
+                # stays "smallest of three" whichever ladder it lands on.
+                src = self.ladder_of(classified_tier)
+                dst = self.ladders.get(role_ladder) or self.ladder
+                idx = src.index(classified_tier)
+                pos = 0 if len(src) < 2 else min(len(dst) - 1, round(idx * (len(dst) - 1) / (len(src) - 1)))
+                tier = dst[pos]
+                reason = f"classifier said {classified_tier}, mapped onto the {role_ladder} ladder"
+        if tier is None:
+            tier, reason = spec.default_tier, f"role default ({spec.name})"
         clamped = False
         if spec.min_tier and self.rank(tier) < self.rank(spec.min_tier):
             tier, clamped = spec.min_tier, True
@@ -243,19 +316,43 @@ class RoutingPolicy:
         if spec is None:
             return list(available), [{"tier": tier, "reason": "tier not declared in routing.yaml"}]
 
+        rejected: list[dict] = []
+
+        def _base(name: str) -> str:
+            """`gemini_3` -> `gemini`: the name config talks about."""
+            head = name.rsplit("_", 1)
+            return head[0] if len(head) == 2 and head[1].isdigit() else name
+
+        # Providers config has benched. Dropped first so neither the ring nor
+        # the last-resort tail can reach them.
+        benched = set()
+        for name in available:
+            reason = self.unavailable.get(_base(name)) or self.unavailable.get(name)
+            if reason:
+                benched.add(name)
+                rejected.append({"provider": name, "reason": f"unavailable: {reason}"})
+
         # Expand the declared base names to live instances, preserving order.
         ordered: list[str] = []
         for base in spec.order:
             for name in available:
+                if name in benched:
+                    continue
                 if name == base or name.startswith(base + "_"):
                     if name not in ordered:
                         ordered.append(name)
-        # Anything configured but not in the tier's ring still beats no answer.
-        for name in available:
-            if name not in ordered:
-                ordered.append(name)
+        # Anything configured but not in the tier's ring still beats no answer —
+        # unless the tier is `strict`, which is how a capability rung guarantees
+        # the model it names is the model that answers.
+        if not spec.strict:
+            for name in available:
+                if name not in ordered and name not in benched:
+                    ordered.append(name)
+        else:
+            for name in available:
+                if name not in ordered and name not in benched:
+                    rejected.append({"provider": name, "reason": f"skipped:not in strict tier {tier} ring"})
 
-        rejected: list[dict] = []
         need_ctx = max(int(spec.min_ctx), int(est_tokens))
         if limits and need_ctx:
             keep = []
@@ -272,8 +369,10 @@ class RoutingPolicy:
                     keep.append(name)
             ordered = keep
 
-        obj = str(objective or self.selection.get("objective", "order"))
+        obj = str(objective or spec.objective or self.selection.get("objective", "order"))
         if obj != "order" and ordered:
+            if tradeoff is None:
+                tradeoff = spec.tradeoff
             t = float(self.selection.get("tradeoff", 0.5) if tradeoff is None else tradeoff)
             costs = {n: self._blended_cost(n, getattr(available[n], "model", None)) for n in ordered}
             quals = {n: self._quality(n, getattr(available[n], "model", None)) for n in ordered}
@@ -315,10 +414,24 @@ class RoutingPolicy:
         return set(self.escalation.get("triggers") or [])
 
     def next_tier(self, tier: str) -> str | None:
-        """One rung up the ladder, or None at the top."""
+        """One rung up the tier's ladder, or None at the top."""
+        rungs = self.ladder_of(tier)
         r = self.rank(tier)
-        if r + 1 < len(self.ladder):
-            return self.ladder[r + 1]
+        if r + 1 < len(rungs):
+            return rungs[r + 1]
+        return None
+
+    def prev_tier(self, tier: str) -> str | None:
+        """One rung DOWN the tier's ladder, or None at the bottom.
+
+        The downgrade direction. Budget pressure walks this, so a run under
+        pressure lands on a genuinely cheaper model rather than on the same
+        model asked to think less.
+        """
+        rungs = self.ladder_of(tier)
+        r = self.rank(tier)
+        if 0 < r < len(rungs):
+            return rungs[r - 1]
         return None
 
     def assess(self, result: dict | None, error: Exception | str | None = None) -> ConfidenceAssessment:
@@ -395,15 +508,30 @@ class RoutingPolicy:
     # ── reporting ────────────────────────────────────────────────────────────
 
     def tier_to_order(self) -> dict[str, list[str]]:
-        """v3-shaped view, so `/v1/routers` keeps reporting `tier_to_order`."""
-        return {name: list(spec.order) for name, spec in self.tiers.items()}
+        """v3-shaped view, so `/v1/routers` keeps reporting `tier_to_order`.
+
+        Scoped to the classifier ladder on purpose: a v3 client reads this dict
+        as "the tiers that exist" and has no idea what a capability rung is.
+        `describe()` reports every ladder for anything that does.
+        """
+        return {name: list(self.tiers[name].order) for name in self.ladder if name in self.tiers}
 
     def describe(self) -> dict:
         return {
             "path": self.path,
             "ladder": self.ladder,
+            "ladders": self.ladders,
+            "unavailable": self.unavailable,
+            "backoff": self.backoff,
             "tiers": {
-                n: {"order": s.order, "min_ctx": s.min_ctx, "description": s.description}
+                n: {
+                    "order": s.order,
+                    "min_ctx": s.min_ctx,
+                    "description": s.description,
+                    "strict": s.strict,
+                    "objective": s.objective,
+                    "ladder": s.ladder,
+                }
                 for n, s in self.tiers.items()
             },
             "default_role": self.default_role,

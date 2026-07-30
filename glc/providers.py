@@ -260,12 +260,53 @@ REASONING_MODEL_HINTS = (
     "o3",
     "o4",
     "gpt-5",
+    # Open-weight thinking families reachable from this gateway. Without these
+    # the gateway accepted `reasoning: low|high` for them and then sent nothing,
+    # so the dial silently did nothing.
+    "glm",
+    "nemotron",
+    "deepseek-v3.2",
+    "deepseek-v4",
 )
+
+#: Models whose thinking channel is ON unless you say otherwise. This is the
+#: measured cause of the empty-answer bug: zai-glm-4.7 on Cerebras spent all 512
+#: of an `max_tokens: 512` budget in its reasoning channel and returned
+#: `content: ""` — a fully billed call with nothing to show the caller. A
+#: `reasoning: "off"` that emits no field at all cannot stop that, so for these
+#: families "off" has to be stated in the dialect the server understands.
+THINKING_BY_DEFAULT_HINTS = (
+    "gpt-oss",
+    "glm",
+    "nemotron",
+    "qwen3",
+    "deepseek-r1",
+    "deepseek-r2",
+    "deepseek-v3.2",
+    "deepseek-v4",
+)
+
+#: The two dialects that exist for "do not think" on an OpenAI-compatible
+#: surface, sent together because no single one is universal: OpenAI-flavoured
+#: servers read `reasoning_effort`, vLLM/SGLang-hosted GLM and Qwen builds read
+#: `chat_template_kwargs.thinking`. Anything the server rejects is stripped on
+#: the 400 and the call is retried, so sending both is safe.
+REASONING_BODY_KEYS = ("reasoning_effort", "chat_template_kwargs")
+
+#: The value that means "do not think", and the ladder to fall back to when a
+#: server insists on one of its own levels instead.
+REASONING_NONE = "none"
+REASONING_LEVELS = ("low", "medium", "high")
 
 
 def _model_supports_reasoning(model: str) -> bool:
     m = (model or "").lower()
     return any(h in m for h in REASONING_MODEL_HINTS)
+
+
+def _thinks_by_default(model: str) -> bool:
+    m = (model or "").lower()
+    return any(h in m for h in THINKING_BY_DEFAULT_HINTS)
 
 
 class OpenAICompatProvider(BaseProvider):
@@ -374,8 +415,26 @@ class OpenAICompatProvider(BaseProvider):
             body["response_format"] = {"type": "json_object"}
 
     def _apply_reasoning(self, body, reasoning, model):
-        if not reasoning or reasoning == "off":
+        """Translate the gateway's `reasoning` dial into this server's dialect.
+
+        Returns True when something was actually put on the wire, which is what
+        `reasoning_applied` reports back to the caller — so a caller can tell a
+        dial that worked from a dial that was silently dropped.
+        """
+        if not reasoning:
             return False
+        if reasoning == "off":
+            # v3 returned here without emitting anything, which is why "off" did
+            # not stop a thinking model from thinking. For a family that thinks
+            # by default, "off" now says so.
+            if not _thinks_by_default(model):
+                return False
+            body["reasoning_effort"] = "none"
+            body["chat_template_kwargs"] = {
+                **(body.get("chat_template_kwargs") or {}),
+                "thinking": False,
+            }
+            return True
         if not _model_supports_reasoning(model):
             return False
         body["reasoning_effort"] = reasoning
@@ -416,9 +475,37 @@ class OpenAICompatProvider(BaseProvider):
             if r.status_code != 200:
                 # Some providers reject reasoning_effort or strict json_schema — retry without them.
                 txt = r.text
-                if reasoning_applied and "reasoning_effort" in txt:
-                    body.pop("reasoning_effort", None)
-                    reasoning_applied = False
+                # Strip whichever reasoning key this server does not know about
+                # and retry. "off" is sent in two dialects on purpose, so the
+                # rejected one has to be droppable without losing the other.
+                # Heal the reasoning fields against the server's own complaint,
+                # one complaint at a time. One pass is not enough: Groq rejects
+                # `chat_template_kwargs` as unsupported and only *then* tells you
+                # `reasoning_effort` must be low|medium|high, so the loop keeps
+                # adjusting until the server stops objecting or nothing is left
+                # to adjust. Bounded, so a stubborn 400 cannot spin.
+                budget = len(REASONING_BODY_KEYS) + 1
+                while r.status_code != 200 and reasoning_applied and budget > 0:
+                    budget -= 1
+                    txt = r.text
+                    changed = False
+                    # A server that enumerates the efforts it accepts is saying
+                    # "none" is not one of them: gpt-oss cannot be stopped from
+                    # thinking, so "off" degrades to the least effort it allows
+                    # rather than failing the call.
+                    if body.get("reasoning_effort") == REASONING_NONE and "reasoning_effort" in txt:
+                        allowed = [lvl for lvl in REASONING_LEVELS if lvl in txt]
+                        if allowed:
+                            body["reasoning_effort"] = allowed[0]
+                            changed = True
+                    if not changed:
+                        for key in REASONING_BODY_KEYS:
+                            if key in body and key in txt:
+                                body.pop(key, None)
+                                changed = True
+                    if not changed:
+                        break
+                    reasoning_applied = any(key in body for key in REASONING_BODY_KEYS)
                     r = await c.post(f"{self.base_url}/chat/completions", headers=self._headers(), json=body)
                 if r.status_code != 200 and "json_schema" in (body.get("response_format") or {}).get(
                     "type", ""

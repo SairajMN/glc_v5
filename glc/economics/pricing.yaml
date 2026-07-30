@@ -35,18 +35,35 @@ unpriced_default:
   input: 0.0
   output: 0.0
 
+# `quality` is a ROUTING WEIGHT, not a benchmark score: it only ever gets
+# compared with the other weights in this file to break a cost tie. The rungs of
+# the capability ladder in routing.yaml are ordered so their weights increase
+# with their blended price, because a rung that costs more and scores lower would
+# never be chosen and the ladder would collapse to one model.
+#
+# Rows marked MEASURED carry numbers taken from this gateway on 2026-07-30: one
+# identical 3-sentence prompt, max_tokens 512, temperature 0, `reasoning: "off"`.
+# `measured_*` keys are documentation — the loader reads input/output/quality and
+# the multipliers, and ignores everything else — so a re-measurement is a config
+# edit with no code consequence.
+
 # ── Models actually reachable from this gateway's default .env ───────────────
 models:
   # Google AI Studio. Free under the course's AI-Studio quota; list rates are
   # recorded so a paid deployment reports real dollars.
   gemini-3.1-flash-lite:
     provider: gemini
+    #: STANDARD rung, second in the ring. MEASURED: 31 in / 89 out,
+    #: $0.00014125, 1236 ms.
     input: 0.25
     output: 1.50
     cache_read_multiplier: 0.25
     cache_write_multiplier: 1.0
     batch_multiplier: 0.5
     quality: 0.62
+    measured_latency_ms: 1236
+    measured_reference_usd: 0.00014125
+    measured_non_empty: true
   gemini-3.1-flash:
     provider: gemini
     input: 0.50
@@ -72,10 +89,18 @@ models:
   # Groq
   openai/gpt-oss-120b:
     provider: groq
+    #: STANDARD rung, first in the ring. MEASURED: 101 in / 117 out,
+    #: $0.0001029, 744 ms. Thinks by default: the same call with the reasoning
+    #: dial left alone spent all 128 output tokens in its reasoning channel and
+    #: returned `content: ""` for $0.00011115 — a fully billed non-answer.
     input: 0.15
     output: 0.75
     cache_read_multiplier: 0.1
     quality: 0.60
+    measured_latency_ms: 744
+    measured_reference_usd: 0.0001029
+    measured_non_empty: true
+    measured_needs_reasoning_off: true
   llama-3.3-70b-versatile:
     provider: groq
     input: 0.59
@@ -85,9 +110,17 @@ models:
   # Cerebras
   zai-glm-4.7:
     provider: cerebras
+    #: FRONTIER rung, second in the ring. MEASURED: 35 in / 86 out, $0.0000605,
+    #: 1033 ms. The worst offender for reasoning: with the dial left alone it
+    #: burned all 512 output tokens thinking and returned `content: ""` for
+    #: $0.0002735 — 4.5x the price of the answer, for no answer.
     input: 0.50
     output: 0.50
     quality: 0.61
+    measured_latency_ms: 1033
+    measured_reference_usd: 0.0000605
+    measured_non_empty: true
+    measured_needs_reasoning_off: true
   llama3.1-8b:
     provider: cerebras
     input: 0.10
@@ -95,11 +128,28 @@ models:
     quality: 0.30
 
   # NVIDIA NIM — free build tier for the course.
+  #
+  # MEASURED 2026-07-30: deepseek-v4-pro and llama-3.1-nemotron-nano-8b-v1 both
+  # accept the connection on this key and never answer — 180 s, then an empty
+  # error. meta/llama-3.1-8b-instruct on the same key answered in 1.37 s. The
+  # provider is benched in routing.yaml's `unavailable:` with that reason; the
+  # rows stay here so the numbers come back correct if NVIDIA_MODEL is repointed.
   deepseek-ai/deepseek-v4-pro:
     provider: nvidia
     input: 0.0
     output: 0.0
     quality: 0.70
+    measured_non_empty: false
+    measured_note: "no response in 180 s, 3/3 attempts"
+  meta/llama-3.1-8b-instruct:
+    provider: nvidia
+    #: The one NVIDIA model measured working. MEASURED: 65 in / 114 out,
+    #: 1365 ms, free on the build tier.
+    input: 0.0
+    output: 0.0
+    quality: 0.30
+    measured_latency_ms: 1365
+    measured_non_empty: true
   deepseek-ai/deepseek-v3.2:
     provider: nvidia
     input: 0.0
@@ -115,10 +165,19 @@ models:
   # on Azure OpenAI once the quota is gone.
   openai/gpt-4.1:
     provider: github
+    #: FRONTIER rung, first in the ring, and the most expensive model this
+    #: gateway can reach. MEASURED: 37 in / 76 out, $0.000682, 2883 ms. Answers
+    #: without any reasoning dial. Context caps at 8k on this surface.
     input: 2.00
     output: 8.00
     cache_read_multiplier: 0.25
-    quality: 0.55
+    #: Raised from 0.55. At 0.55 the frontier rung scored BELOW gpt-oss-120b
+    #: (0.60) at a quarter of its price, so any cost/quality objective demoted
+    #: it out of its own rung and the ladder collapsed to one model.
+    quality: 0.72
+    measured_latency_ms: 2883
+    measured_reference_usd: 0.000682
+    measured_non_empty: true
   openai/gpt-4.1-mini:
     provider: github
     input: 0.40
@@ -126,13 +185,35 @@ models:
     cache_read_multiplier: 0.25
     quality: 0.52
 
+  # OpenRouter free tier — CHEAP rung, second in the ring. Priced by name rather
+  # than by the `*:free` glob so the ladder's second rung is not a guess.
+  # MEASURED: 47 in / 108 out, $0.00, 1849 ms. Thinks by default and leaks the
+  # scratchpad straight into `content` when it runs out of tokens.
+  nvidia/nemotron-3-super-120b-a12b:free:
+    provider: openrouter
+    input: 0.0
+    output: 0.0
+    quality: 0.38
+    measured_latency_ms: 1849
+    measured_reference_usd: 0.0
+    measured_non_empty: true
+    measured_needs_reasoning_off: true
+
   # Local via Ollama — never charged, but priced at 0 explicitly so the report
   # says "free because local" rather than "unpriced".
+  #
+  # CHEAP rung, first in the ring. MEASURED: 46 in / 379 out, $0.00, 39570 ms.
+  # The dollar cost is genuinely zero and the wall-clock cost is 53x the frontier
+  # rung's — the cheapest rung on a price ladder is not the cheapest rung on a
+  # latency ladder, and a router that only reads prices cannot see that.
   gemma4:31b:
     provider: ollama
     input: 0.0
     output: 0.0
     quality: 0.42
+    measured_latency_ms: 39570
+    measured_reference_usd: 0.0
+    measured_non_empty: true
   microsoft/Phi-4-mini-instruct:
     provider: github
     input: 0.0

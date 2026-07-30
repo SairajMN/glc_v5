@@ -362,3 +362,138 @@ def test_empty_tiers_is_a_loud_error(tmp_path, monkeypatch):
 def test_ladder_referencing_an_undeclared_tier_is_a_loud_error(tmp_path, monkeypatch):
     with pytest.raises(PO.RoutingConfigError):
         _pol(tmp_path, monkeypatch, "version: 1\nladder: [A, GHOST]\ntiers:\n  A: {order: []}\n")
+
+
+# ── the cross-model capability ladder (build 4) ─────────────────────────────
+#
+# The half-truth this closes: with every tier pointing at the same model, a
+# "routing" decision could only ever change how hard one model was allowed to
+# think. These tests pin the shipped ladder to genuinely different models and
+# pin the three mechanisms that make a rung a rung.
+
+
+def _ladder_providers():
+    """The live pool as it actually is: a Gemini key pool plus one instance each."""
+    return _providers(
+        gemini_1="gemini-3.1-flash-lite",
+        gemini_2="gemini-3.1-flash-lite",
+        groq="openai/gpt-oss-120b",
+        cerebras="zai-glm-4.7",
+        github="openai/gpt-4.1",
+        openrouter="nvidia/nemotron-3-super-120b-a12b:free",
+        ollama="gemma4:31b",
+        nvidia="deepseek-ai/deepseek-v4-pro",
+    )
+
+
+def test_the_shipped_ladder_has_a_second_named_ladder():
+    pol = _pol()
+    assert pol.ladders["capability"] == ["CHEAP", "STANDARD", "FRONTIER"]
+    # The classifier ladder is untouched, so v3 routing has not moved.
+    assert pol.ladder == ["TINY", "LARGE", "HUGE"]
+
+
+def test_each_capability_rung_names_a_different_model():
+    """The whole point: the rungs differ by MODEL, not by reasoning effort."""
+    pol, avail = _pol(), _ladder_providers()
+    picked = {}
+    for tier in pol.ladders["capability"]:
+        ordered, _ = pol.order_for(tier, avail, limits=LIMITS)
+        assert ordered, tier
+        picked[tier] = avail[ordered[0]].model
+    assert len(set(picked.values())) == len(picked), picked
+    # And they are ordered by blended price, cheapest rung first.
+    blended = [pol._blended_cost(t, m) for t, m in picked.items()]
+    assert blended == sorted(blended), picked
+
+
+def test_a_strict_rung_cannot_be_served_by_a_model_outside_its_ring():
+    """Without `strict` the tail-append lets any provider answer any tier, so a
+    CHEAP request could land on the frontier model."""
+    pol, avail = _pol(), _ladder_providers()
+    ordered, rejected = pol.order_for("CHEAP", avail, limits=LIMITS)
+    assert {avail[n].model for n in ordered} <= {"gemma4:31b", "nvidia/nemotron-3-super-120b-a12b:free"}
+    assert "github" not in ordered
+    assert any("strict" in r["reason"] for r in rejected)
+
+
+def test_a_non_strict_tier_still_appends_every_other_provider():
+    """Backward compatibility: the classifier tiers keep v3's tail-append."""
+    pol, avail = _pol(), _ladder_providers()
+    ordered, _ = pol.order_for("TINY", avail, limits=LIMITS, objective="order")
+    assert set(ordered) | {"nvidia"} == set(avail)  # nvidia is benched, see below
+
+
+def test_a_benched_provider_is_dropped_from_every_tier_with_its_reason():
+    pol, avail = _pol(), _ladder_providers()
+    assert "nvidia" in pol.unavailable
+    for tier in list(pol.tiers):
+        ordered, rejected = pol.order_for(tier, avail, limits=LIMITS)
+        assert "nvidia" not in ordered, tier
+        assert any(r["provider"] == "nvidia" and "unavailable" in r["reason"] for r in rejected), tier
+
+
+def test_benching_is_config_and_lifting_it_needs_no_code(tmp_path, monkeypatch):
+    text = "version: 1\ntiers:\n  T:\n    order: [groq, nvidia]\nladder: [T]\n"
+    pol = _pol(tmp_path, monkeypatch, text)
+    ordered, _ = pol.order_for("T", _ladder_providers(), limits=LIMITS)
+    assert "nvidia" in ordered
+
+
+def test_a_rung_pins_its_declared_order_against_the_global_objective():
+    """`objective: order` per tier. The global dial is cost_quality, which would
+    otherwise re-sort a one-model rung into somebody else's model."""
+    pol = _pol()
+    assert pol.selection.get("objective") == "cost_quality"
+    for tier in pol.ladders["capability"]:
+        assert pol.tiers[tier].objective == "order"
+    avail = _ladder_providers()
+    ordered, _ = pol.order_for("CHEAP", avail, limits=LIMITS)
+    assert avail[ordered[0]].model == "gemma4:31b"
+
+
+def test_the_capability_ladder_escalates_and_downgrades_within_itself():
+    pol = _pol()
+    assert pol.next_tier("CHEAP") == "STANDARD"
+    assert pol.next_tier("STANDARD") == "FRONTIER"
+    assert pol.next_tier("FRONTIER") is None
+    assert pol.prev_tier("FRONTIER") == "STANDARD"
+    assert pol.prev_tier("STANDARD") == "CHEAP"
+    assert pol.prev_tier("CHEAP") is None
+    # The two ladders never see each other's rungs.
+    assert pol.next_tier("HUGE") is None
+    assert pol.prev_tier("TINY") is None
+
+
+def test_a_role_on_the_capability_ladder_gets_a_capability_rung():
+    """A role's default tier is what selects its ladder, and the classifier's
+    verdict is carried across by position rather than discarded."""
+    pol = _pol()
+    assert pol.tier_for("worker", "TINY").tier == "CHEAP"
+    assert pol.tier_for("worker", "LARGE").tier == "STANDARD"
+    assert pol.tier_for("worker", "HUGE").tier == "FRONTIER"
+    # Floors and ceilings then override it — the headline claim.
+    assert pol.tier_for("adjudicator", "TINY").tier == "FRONTIER"
+    assert pol.tier_for("bulk", "HUGE").tier == "CHEAP"
+    # And a role on the classifier ladder is completely unaffected.
+    assert pol.tier_for("decision", "TINY").tier == "LARGE"
+
+
+def test_a_tier_on_two_ladders_is_a_loud_error(tmp_path, monkeypatch):
+    text = "version: 1\ntiers:\n  A: {}\n  B: {}\nladder: [A, B]\nladders:\n  other: [B]\n"
+    with pytest.raises(PO.RoutingConfigError):
+        _pol(tmp_path, monkeypatch, text)
+
+
+def test_a_named_ladder_referencing_an_undeclared_tier_is_a_loud_error(tmp_path, monkeypatch):
+    text = "version: 1\ntiers:\n  A: {}\nladder: [A]\nladders:\n  other: [NOPE]\n"
+    with pytest.raises(PO.RoutingConfigError):
+        _pol(tmp_path, monkeypatch, text)
+
+
+def test_tier_to_order_stays_scoped_to_the_classifier_ladder():
+    """A v3 client reads tier_to_order as `the tiers that exist` and has never
+    heard of a capability rung."""
+    pol = _pol()
+    assert set(pol.tier_to_order()) == {"TINY", "LARGE", "HUGE"}
+    assert set(pol.describe()["tiers"]) > set(pol.tier_to_order())
