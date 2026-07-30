@@ -106,17 +106,22 @@ ladders:
 # reported as a per-candidate rejection so the refusal names the reason. This is
 # how a broken endpoint is taken out of rotation without a Python edit; delete
 # the line to bring it back.
-unavailable:
-  nvidia: >
-    MEASURED 2026-07-30: the model this deployment's NVIDIA_MODEL selects
-    (deepseek-ai/deepseek-v4-pro) accepts the connection and then never
-    answers — the request sits for the client's full 180 s timeout and fails
-    with an EMPTY error string, three times out of three.
-    nvidia/llama-3.1-nemotron-nano-8b-v1 behaves identically. The endpoint and
-    the key are fine: meta/llama-3.1-8b-instruct on the same key answered in
-    1.37 s (65 in / 114 out). So this is a bad model pin, not a dead provider,
-    and the fix is one NVIDIA_MODEL edit in .env — which is why the reason is
-    written out here rather than the provider being deleted from the rings.
+unavailable: {}
+  # RESOLVED 2026-07-30. nvidia was benched here, and the entry is worth reading
+  # even though it is now empty, because the diagnosis is the lesson.
+  #
+  # The symptom: every nvidia call sat for the client's full 180 s timeout and
+  # failed with an EMPTY error string, three times out of three. That looked
+  # like a dead provider. It was not. The deployment's NVIDIA_MODEL selected
+  # deepseek-ai/deepseek-v4-pro, which accepts the connection and never answers;
+  # nvidia/llama-3.1-nemotron-nano-8b-v1 behaved identically. The endpoint and
+  # the key were fine the whole time — meta/llama-3.1-8b-instruct on the same
+  # key answered in 1.37 s.
+  #
+  # So it was a bad model pin, not a dead provider, and the fix was one
+  # NVIDIA_MODEL edit. Re-measured after that edit: 1 205 ms, 227 chars, and
+  # nvidia is back in every ring it belongs to. Bench by name here when an
+  # endpoint is genuinely broken; delete the line to bring it back.
 
 # ── Cooldowns ───────────────────────────────────────────────────────────────
 # Seconds a provider stays benched after each class of failure. Overrides the

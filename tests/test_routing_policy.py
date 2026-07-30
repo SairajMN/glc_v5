@@ -421,16 +421,35 @@ def test_a_non_strict_tier_still_appends_every_other_provider():
     """Backward compatibility: the classifier tiers keep v3's tail-append."""
     pol, avail = _pol(), _ladder_providers()
     ordered, _ = pol.order_for("TINY", avail, limits=LIMITS, objective="order")
-    assert set(ordered) | {"nvidia"} == set(avail)  # nvidia is benched, see below
+    assert set(ordered) == set(avail)  # nothing benched: the tail carries them all
 
 
-def test_a_benched_provider_is_dropped_from_every_tier_with_its_reason():
-    pol, avail = _pol(), _ladder_providers()
-    assert "nvidia" in pol.unavailable
+def test_a_benched_provider_is_dropped_from_every_tier_with_its_reason(tmp_path, monkeypatch):
+    """Benching is a config mechanism, so the test benches an arbitrary provider
+    rather than asserting whichever one happens to be broken today. The shipped
+    `unavailable:` map is empty — every provider currently answers."""
+    benched = "groq"
+    text = (
+        "version: 1\n"
+        "tiers:\n"
+        "  LOW:\n    order: [groq, gemini]\n"
+        "  HIGH:\n    order: [github, groq]\n"
+        "ladder: [LOW, HIGH]\n"
+        f"unavailable:\n  {benched}: measured broken in this fixture\n"
+    )
+    pol = _pol(tmp_path, monkeypatch, text)
+    avail = _ladder_providers()
+    assert benched in pol.unavailable
     for tier in list(pol.tiers):
         ordered, rejected = pol.order_for(tier, avail, limits=LIMITS)
-        assert "nvidia" not in ordered, tier
-        assert any(r["provider"] == "nvidia" and "unavailable" in r["reason"] for r in rejected), tier
+        assert benched not in ordered, tier
+        assert any(r["provider"] == benched and "unavailable" in r["reason"] for r in rejected), tier
+
+
+def test_nothing_is_benched_in_the_shipped_config():
+    """A bench is a temporary measure with a written reason. When the reason is
+    fixed the line goes, and this test is what notices it was left behind."""
+    assert _pol().unavailable == {}
 
 
 def test_benching_is_config_and_lifting_it_needs_no_code(tmp_path, monkeypatch):
