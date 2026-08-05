@@ -1,4 +1,4 @@
-"""FastAPI app for glc_v4. Port 8111 by default. V9 routes are mounted
+"""FastAPI app for glc_v5. Port 8111 by default. V9 routes are mounted
 as-is (S9 Browser / S10 Computer-Use clients work unchanged); the
 S11 surfaces (transcribe, speak, channels WS, control) sit alongside, and
 v4 adds the economics surface (budgets, principal cost, cache stats).
@@ -32,6 +32,7 @@ from glc import providers as P  # noqa: E402
 from glc.audit import init_store as init_audit  # noqa: E402
 from glc.cache import GeminiCache  # noqa: E402
 from glc.cache.semantic import build_semantic_cache  # noqa: E402
+from glc.channels.agent_bridge import S16AgentBridge  # noqa: E402
 from glc.config import get_or_create_install_token  # noqa: E402
 from glc.economics import budget as budget_mod  # noqa: E402
 from glc.economics import meter as meter_mod  # noqa: E402
@@ -141,7 +142,10 @@ async def lifespan(app: FastAPI):
     _boot_economics(app)
     app.state.started_at = time.time()
     app.state.registered_channels = []
+    agent_bridge = S16AgentBridge()
+    app.state.agent_bridge = agent_bridge
     yield
+    await agent_bridge.close()
     t = getattr(app.state, "telemetry", None)
     if t is not None:
         t.flush()
@@ -149,7 +153,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="GLC v4 — Gateway for Models, Routing, Channels and Agent Economics",
+    title="GLC v5 — Connected Gateway for Models, Channels and S16 Agents",
     lifespan=lifespan,
 )
 

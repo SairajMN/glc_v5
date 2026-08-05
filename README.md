@@ -1,8 +1,11 @@
-# glc_v4
+# glc_v5
 
-`glc_v4` is the local Gateway for LLMs and Channels used by EAG V3. It owns provider credentials, model routing, rate limits, cost and audit records, voice, and channel adapters. Agent runtimes call it over HTTP; they do not import its provider code or read its keys.
+`glc_v5` is the local Gateway for LLMs and Channels used by EAG V3. It owns provider credentials, model routing, rate limits, cost and audit records, voice, and channel adapters. Agent runtimes call it over HTTP; they do not import its provider code or read its keys.
 
-v4 is `glc_v3` plus **agent economics**: the gateway now knows what a call costs, who it is billed to, and whether it is allowed to happen. Session 15 builds on it. Every v3 route, request field and response field still works unchanged — see `## What v4 adds` below.
+v5 keeps every v4 model and economics contract, and adds one channel-to-agent
+connection. Every enabled adapter converts its native payload into the same
+`ChannelMessage`; GLC verifies the sender, forwards that envelope to S16, and
+returns S16's `ChannelReply` through the same adapter.
 
 ## Requirements
 
@@ -53,6 +56,30 @@ curl -s http://127.0.0.1:8111/v1/chat \
 ```
 
 The response reports the actual provider slot and model used.
+
+## Connect every channel to S16
+
+Run GLC and S16 as separate services. Put the same private bridge token in both
+local `.env` files:
+
+```dotenv
+# glc_v5/.env
+S16_BASE_URL=http://127.0.0.1:8113
+GLC_S16_BRIDGE_TOKEN=replace-with-a-long-random-local-token
+
+# S16Code/.env
+GLC_BASE_URL=http://127.0.0.1:8111
+S16_CHANNEL_BRIDGE_TOKEN=replace-with-a-long-random-local-token
+```
+
+`GET /v1/channels` is the live catalogue. There is no second list of Telegram,
+Gmail, Slack, or future adapter names in S16. Inbound adapter WebSockets all use
+the same bridge; proactive work uses `POST /v1/channels/{name}/send`. A newly
+installed adapter is therefore discovered without changing agent code.
+
+GLC recomputes trust from its pairing store before forwarding a message. It
+never accepts a client-supplied owner identity. The bridge token authenticates
+GLC to S16; it is not a user token and must not be committed.
 
 ## What v4 adds
 
@@ -138,18 +165,19 @@ upgraded in place on boot: existing rows keep their meaning and every v3 query
 still answers. Spend is read back out of this ledger rather than tracked in a
 parallel counter, so it survives a restart and cannot drift from what was billed.
 
-## Relationship to Session 13
+## Relationship to Session 16
 
-`glc_v4` is a dependency of `S13Code`/`S15Code`, not its parent project. The ownership boundary is deliberate:
+`glc_v5` is a dependency of `S16Code`, not its parent project. The ownership boundary is deliberate:
 
-| `glc_v3` owns | `S13Code` owns |
+| `glc_v5` owns | `S16Code` owns |
 |---|---|
 | Keys, providers and models | Live task graph |
 | Routing, quotas and costs | Memory and semantic indexing |
 | Channels and voice | A2A discovery and delegation |
 | `/v1/chat` | `/v1/agent/*` |
 
-`glc_v3` must return `404` for Session 13 agent routes. `S13Code` must return `404` for gateway model routes.
+`glc_v5` exposes only the narrow channel bridge into S16; it does not own the
+agent graph. S16 does not import adapters or provider credentials.
 
 ## Development
 

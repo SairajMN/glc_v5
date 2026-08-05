@@ -1,7 +1,7 @@
 [project]
-name = "glc-v4"
-version = "0.4.0"
-description = "GLC v4 — glc_v3 plus agent economics: per-model pricing, principal attribution, a hard budget controller, OTel GenAI spans, role/cost routing and a semantic response cache."
+name = "glc-v5"
+version = "0.5.0"
+description = "GLC v5 — glc_v4 plus one generic bidirectional connection between every channel adapter and S16Code."
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.110",
