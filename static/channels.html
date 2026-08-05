@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GLC v5 · Channels</title>
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --border:#30363d; --text:#c9d1d9; --muted:#8b949e; --blue:#58a6ff; --green:#3fb950; --yellow:#d29922; --red:#f85149; }
+  * { box-sizing:border-box; } body { margin:0; background:var(--bg); color:var(--text); font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+  header { padding:14px 20px; border-bottom:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; } h1 { margin:0; font-size:18px; } nav a { color:var(--blue); margin-left:16px; text-decoration:none; }
+  main { max-width:1300px; padding:22px; margin:auto; } .intro { color:var(--muted); max-width:860px; line-height:1.5; } .auth { display:flex; gap:10px; margin:20px 0; align-items:center; flex-wrap:wrap; } input { background:#0d1117; color:var(--text); border:1px solid var(--border); border-radius:5px; padding:8px; } button { background:var(--blue); color:white; border:0; border-radius:5px; padding:8px 12px; cursor:pointer; } button.secondary { background:#30363d; } button:disabled { opacity:.55; cursor:not-allowed; }
+  #notice { color:var(--yellow); min-height:20px; } .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(370px,1fr)); gap:14px; } .card { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:16px; } .head { display:flex; align-items:center; justify-content:space-between; gap:8px; } h2 { font-size:16px; margin:0; text-transform:capitalize; } .mode { color:var(--muted); margin:7px 0 13px; font-size:12px; } .badge { border-radius:12px; padding:3px 8px; font-size:11px; background:#21262d; color:var(--muted); } .badge.ready { color:var(--green); background:#12351c; } .badge.partial { color:var(--yellow); background:#3d2d08; } .field { display:grid; grid-template-columns:1fr 1.3fr; gap:8px; align-items:center; margin:7px 0; } .field label { font-size:12px; color:var(--muted); } .field label small { display:block; font-size:10px; } .configured { color:var(--green); font-size:11px; } .steps { margin:13px 0; padding-left:18px; color:var(--muted); font-size:12px; line-height:1.45; } code { color:#b6d7ff; font-size:11px; overflow-wrap:anywhere; } .webhook { padding:9px; background:#0d1117; border:1px solid var(--border); border-radius:5px; font-size:11px; margin:10px 0; } .footer { margin-top:13px; display:flex; gap:9px; align-items:center; } .restart { color:var(--yellow); font-size:11px; }
+</style>
+</head>
+<body>
+<header><h1>⚡ GLC <span style="color:#a371f7">v5</span> · Channels</h1><nav><a href="/">Model dashboard</a><a href="/help">Help</a></nav></header>
+<main>
+  <p class="intro">Configure only credentials that an existing GLC adapter actually consumes. Existing secrets are never returned to the browser—only whether a value exists. Saving changes writes an owner-only file on this machine; restart GLC before an adapter uses new credentials. “Configured” never means provider-connected: complete the card’s provider-side setup and send a real inbound test.</p>
+  <div class="auth"><input id="token" type="password" autocomplete="off" placeholder="GLC installation control token" size="42"><button onclick="loadChannels()">Unlock setup</button><button class="secondary" onclick="forget()">Forget token</button></div>
+  <div id="notice"></div><div id="channels" class="grid"></div>
+</main>
+<script>
+const tokenInput = document.getElementById('token'); tokenInput.value = sessionStorage.getItem('glc-control-token') || '';
+function auth() { return {'Authorization': 'Bearer ' + tokenInput.value}; }
+function esc(value) { const d=document.createElement('div'); d.textContent=value || ''; return d.innerHTML; }
+function forget() { sessionStorage.removeItem('glc-control-token'); tokenInput.value=''; document.getElementById('channels').innerHTML=''; }
+function notice(message, error=false) { const n=document.getElementById('notice'); n.style.color=error?'var(--red)':'var(--yellow)'; n.textContent=message; }
+async function loadChannels() {
+  if (!tokenInput.value) return notice('Enter the token stored in ~/.glc/install_token on this gateway machine.', true);
+  const response = await fetch('/v1/channel-admin/catalogue', {headers:auth()});
+  if (!response.ok) return notice((await response.json()).detail || 'Could not unlock setup.', true);
+  sessionStorage.setItem('glc-control-token', tokenInput.value);
+  const data = await response.json(); notice(''); render(data.channels);
+}
+function render(channels) {
+  const root=document.getElementById('channels'); root.innerHTML='';
+  for (const channel of channels) {
+    const fields=channel.fields.map(field => `<div class="field"><label for="${channel.name}-${field.key}">${esc(field.label)}<small>${field.secret?'secret · ':''}${field.configured?'<span class="configured">saved</span>':'not set'}</small></label><input id="${channel.name}-${field.key}" data-key="${field.key}" type="${field.secret?'password':'text'}" placeholder="${field.configured?'Leave blank to keep saved value':'Enter value'}"></div>`).join('');
+    const steps=channel.steps.map(step=>`<li>${esc(step)}</li>`).join('');
+    const webhook=channel.webhook_url?`<div class="webhook"><b>Webhook URL</b><br><code>${esc(channel.webhook_url)}</code></div>`:'';
+    const docs=channel.docs?`<p style="font-size:12px;margin:8px 0"><a style="color:var(--blue)" href="${esc(channel.docs)}" target="_blank" rel="noreferrer">Open provider setup / documentation ↗</a></p>`:'';
+    const card=document.createElement('section'); card.className='card'; card.id='card-'+channel.name;
+    const status = channel.can_configure ? (channel.configured ? 'configured — live test required' : channel.enabled ? 'needs settings' : 'disabled') : 'guide only — external bridge required';
+    const controls = channel.can_configure ? `<label style="font-size:12px"><input type="checkbox" id="${channel.name}-enabled" ${channel.enabled?'checked':''}> Load saved settings after restart</label>${fields}<div class="footer"><button onclick="save('${channel.name}')">Save locally</button><span class="restart"></span></div>` : `<p style="font-size:12px;color:var(--yellow)">GLC cannot apply credentials for this adapter yet. Follow the external-bridge steps above.</p>`;
+    card.innerHTML=`<div class="head"><h2>${esc(channel.name)}</h2><span class="badge ${channel.configured?'partial':''}">${status}</span></div><div class="mode">${esc(channel.mode)}</div>${docs}${webhook}<ol class="steps">${steps}</ol>${controls}`;
+    root.appendChild(card);
+  }
+}
+async function save(name) {
+  const card=document.getElementById('card-'+name), values={};
+  card.querySelectorAll('[data-key]').forEach(input => { if (input.value) values[input.dataset.key]=input.value; });
+  const enabled=document.getElementById(name+'-enabled').checked;
+  const response=await fetch('/v1/channel-admin/'+encodeURIComponent(name), {method:'PUT', headers:{...auth(),'Content-Type':'application/json'}, body:JSON.stringify({enabled,values})});
+  if (!response.ok) return notice((await response.json()).detail || 'Save failed.', true);
+  card.querySelector('.restart').textContent='Saved locally. Restart GLC, complete the provider setup, then run a real inbound test.';
+  [...card.querySelectorAll('[data-key]')].forEach(input=>input.value='');
+  setTimeout(loadChannels, 150);
+}
+</script>
+</body></html>

@@ -7,6 +7,26 @@ connection. Every enabled adapter converts its native payload into the same
 `ChannelMessage`; GLC verifies the sender, forwards that envelope to S16, and
 returns S16's `ChannelReply` through the same adapter.
 
+## Channel setup UI
+
+Open `http://127.0.0.1:8111/channels` and enter the installation control token
+from `~/.glc/install_token`. The page covers every registered adapter and
+returns only whether a value is saved — never the secret itself. It offers
+saveable fields only when the existing adapter consumes those exact values;
+adapters that need an injected external client/transport are guide-only.
+Settings are stored locally in `~/.glc/channel_secrets.json` with owner-only
+permissions and are loaded on the next GLC restart. Existing environment
+variables win.
+
+“Configured” means local values are present; it does **not** claim the
+provider has been authenticated or live-tested. Gmail presently uses its local
+OAuth helper rather than a browser callback, and several adapters still need a
+provider bridge/polling process. The generated ingress endpoint is shown only
+for the two adapters whose current native protocol GLC actually handles:
+`webhook` and Meta WhatsApp (including its Meta `hub.*` verification GET).
+Set `GLC_PUBLIC_BASE` before using either externally, then perform a real
+inbound test before enabling autonomous actions.
+
 ## Requirements
 
 - Python 3.11 or newer

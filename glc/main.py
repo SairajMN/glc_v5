@@ -33,6 +33,7 @@ from glc.audit import init_store as init_audit  # noqa: E402
 from glc.cache import GeminiCache  # noqa: E402
 from glc.cache.semantic import build_semantic_cache  # noqa: E402
 from glc.channels.agent_bridge import S16AgentBridge  # noqa: E402
+from glc.channels.setup import apply_saved_environment  # noqa: E402
 from glc.config import get_or_create_install_token  # noqa: E402
 from glc.economics import budget as budget_mod  # noqa: E402
 from glc.economics import meter as meter_mod  # noqa: E402
@@ -129,6 +130,10 @@ def _boot_economics(app: FastAPI) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Channel settings are local to this gateway installation.  Existing
+    # adapter environment variables remain the runtime contract, so load saved
+    # values before adapters are ever instantiated (without serving them back).
+    apply_saved_environment()
     db.init()
     init_audit()
     get_or_create_install_token()
@@ -178,6 +183,11 @@ async def index() -> FileResponse:
 @app.get("/help", response_class=FileResponse)
 async def help_page() -> FileResponse:
     return FileResponse(STATIC / "help.html")
+
+
+@app.get("/channels", response_class=FileResponse)
+async def channels_page() -> FileResponse:
+    return FileResponse(STATIC / "channels.html")
 
 
 @app.get("/healthz")

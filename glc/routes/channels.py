@@ -19,17 +19,26 @@ import os
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import JSONResponse, PlainTextResponse
+from pydantic import BaseModel, Field
 
 from glc.audit import append as audit_append
 from glc.channels import registry
 from glc.channels.agent_bridge import AgentBridgeError
 from glc.channels.envelope import ChannelMessage, ChannelReply
+from glc.channels.setup import CHANNEL_SPECS, public_catalogue, update
 from glc.config import get_or_create_install_token
 from glc.security.allowlists import allowed
 from glc.security.pairing import get_pairing_store
 from glc.security.rate_limits import get_rate_limiter
 
 router = APIRouter()
+
+
+class ChannelSettingsUpdate(BaseModel):
+    """Only non-empty fields replace saved values; a blank clears one value."""
+
+    enabled: bool | None = None
+    values: dict[str, str] = Field(default_factory=dict)
 
 
 def _bridge(state):
@@ -154,6 +163,11 @@ async def channel_ws(websocket: WebSocket, name: str, token: str | None = Query(
 
 @router.get("/v1/channels/{name}/webhook")
 async def channel_webhook_verify(name: str, request: Request):
+    # The hub.* GET challenge is Meta's protocol. Do not pretend Telegram,
+    # Slack, Teams, or other providers can use it just because they share a
+    # route shape.
+    if CHANNEL_SPECS.get(name, {}).get("verification") != "meta_hub":
+        raise HTTPException(status_code=404, detail="this channel has no GLC-native webhook verification")
     params = dict(request.query_params)
     mode = params.get("hub.mode", "")
     token = params.get("hub.verify_token", "")
@@ -238,6 +252,38 @@ async def channel_catalogue(request: Request):
             for name in registry.list_channels()
         ]
     }
+
+
+def _require_admin(authorization: str | None) -> None:
+    # S16's bridge token can send an already-authorised outbound message, but
+    # it must never gain access to the human setup/credential surface.
+    presented = (authorization or "").removeprefix("Bearer ").strip()
+    if not presented or not hmac.compare_digest(presented, get_or_create_install_token()):
+        raise HTTPException(status_code=401, detail="enter this installation's control token")
+
+
+@router.get("/v1/channel-admin/catalogue")
+async def channel_admin_catalogue(request: Request, authorization: str | None = Header(default=None)):
+    """Safe setup view: values are represented solely by presence booleans."""
+    _require_admin(authorization)
+    base = os.getenv("GLC_PUBLIC_BASE", str(request.base_url).rstrip("/"))
+    return {"channels": public_catalogue(base, registry.list_channels())}
+
+
+@router.put("/v1/channel-admin/{name}")
+async def update_channel_settings(
+    name: str,
+    settings: ChannelSettingsUpdate,
+    authorization: str | None = Header(default=None),
+):
+    _require_admin(authorization)
+    if name not in CHANNEL_SPECS or name not in registry.list_channels():
+        raise HTTPException(status_code=404, detail=f"unknown channel: {name}")
+    update(name, settings.values, settings.enabled)
+    # The process environment is intentionally not changed here. A restart is
+    # required before a legacy adapter consumes new credentials, preventing a
+    # half-reconfigured live connection.
+    return {"ok": True, "restart_required": True}
 
 
 @router.post("/v1/channels/{name}/send")
