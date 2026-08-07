@@ -41,6 +41,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["glc"]
+# The operator pages are part of the product, not repo decoration. Without
+# this a non-editable install resolves STATIC into site-packages and every
+# page 404s while the API keeps working, which is a confusing way to fail.
+force-include = { "static" = "glc/_static" }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

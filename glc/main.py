@@ -23,7 +23,11 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 ROOT = Path(__file__).parent
-STATIC = ROOT.parent / "static"
+# Source checkout keeps the pages at the repo root; an installed wheel keeps
+# them beside the package. Try both, so "the API works but every page is
+# missing" cannot happen silently because of how somebody installed it.
+STATIC = next((c for c in (ROOT.parent / "static", ROOT / "_static") if c.is_dir()),
+              ROOT.parent / "static")
 load_dotenv(ROOT.parent / ".env")  # repo .env, if present
 
 from glc import db  # noqa: E402
