@@ -236,13 +236,26 @@ models:
   # The dollar cost is genuinely zero and the wall-clock cost is 53x the frontier
   # rung's — the cheapest rung on a price ladder is not the cheapest rung on a
   # latency ladder, and a router that only reads prices cannot see that.
-  gemma4:31b:
+  qwen3.8:27b:
     provider: ollama
+    #: CHEAP rung. Local, so free. MEASURED 2026-08-15 on this machine:
+    #: 17 GB, answers in 2 eval tokens with thinking off.
+    #:
+    #: THINKS BY DEFAULT, and this is not cosmetic. With `think` left alone and
+    #: num_predict=8 it spent all eight tokens in its reasoning channel and
+    #: returned content:"" — the same fully-billed non-answer already recorded
+    #: here for zai-glm-4.7 and gpt-oss-120b. Send think:false.
     input: 0.0
     output: 0.0
-    quality: 0.42
-    measured_latency_ms: 39570
-    measured_reference_usd: 0.0
+    quality: 0.58
+    measured_non_empty: true
+    measured_needs_reasoning_off: true
+  phi4:latest:
+    provider: ollama
+    #: Local fallback. MEASURED 2026-08-15: answers plainly, no reasoning channel.
+    input: 0.0
+    output: 0.0
+    quality: 0.44
     measured_non_empty: true
   microsoft/Phi-4-mini-instruct:
     provider: github

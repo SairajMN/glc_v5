@@ -62,8 +62,9 @@ tiers:
     strict: true
     objective: order
     description: >
-      Local weights first (gemma4:31b, $0.00/Mtok, measured 39.6 s for a
-      379-token answer), then OpenRouter's free tier
+      Local weights first (qwen3.8:27b, $0.00/Mtok, 17 GB on disk; it
+      thinks by default and must be called with think:false or it
+      returns an empty answer), then OpenRouter's free tier
       (nvidia/nemotron-3-super-120b-a12b:free, $0.00, measured 1.8 s). Free in
       dollars, expensive in wall-clock on the local rung — which is the real
       tradeoff a cheap rung buys, and the reason latency belongs next to price.
