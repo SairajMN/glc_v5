@@ -64,20 +64,49 @@ models:
     measured_latency_ms: 1236
     measured_reference_usd: 0.00014125
     measured_non_empty: true
-  gemini-3.1-flash:
+  # CHECKED 2026-08-15 against ai.google.dev: gemini-3.1-flash is no longer
+  # published, and gemini-3.1-pro exists only as gemini-3.1-pro-preview, which
+  # is NOT on the free tier. Both removed rather than left to 404 in routing.
+  #
+  # Everything below is free-tier eligible as of 2026-08-15. Prices are list
+  # rates so a paid deployment still reports real dollars.
+  gemini-3.7-flash:
+    provider: gemini
+    #: FRONTIER rung. Newest free flash. Unmeasured on this gateway.
+    input: 0.50
+    output: 3.00
+    cache_read_multiplier: 0.25
+    batch_multiplier: 0.5
+    quality: 0.82
+  gemini-3.6-flash:
     provider: gemini
     input: 0.50
     output: 3.00
     cache_read_multiplier: 0.25
     batch_multiplier: 0.5
-    quality: 0.70
-  gemini-3.1-pro:
+    quality: 0.78
+  gemini-3.5-flash:
     provider: gemini
-    input: 2.00
-    output: 12.00
+    input: 0.45
+    output: 2.75
     cache_read_multiplier: 0.25
     batch_multiplier: 0.5
-    quality: 0.78
+    quality: 0.74
+  gemini-3.5-flash-lite:
+    provider: gemini
+    input: 0.20
+    output: 1.20
+    cache_read_multiplier: 0.25
+    batch_multiplier: 0.5
+    quality: 0.66
+  gemini-2.5-pro:
+    provider: gemini
+    #: Free tier despite the pro name. Worth a FRONTIER slot on quality alone.
+    input: 1.25
+    output: 10.00
+    cache_read_multiplier: 0.25
+    batch_multiplier: 0.5
+    quality: 0.76
   gemini-2.5-flash:
     provider: gemini
     input: 0.30
@@ -106,10 +135,37 @@ models:
     input: 0.59
     output: 0.79
     quality: 0.48
+  # CHECKED 2026-08-15 against console.groq.com/docs/models.
+  openai/gpt-oss-20b:
+    provider: groq
+    #: CHEAP rung. Smaller sibling of the 120b already in the ring.
+    input: 0.10
+    output: 0.50
+    quality: 0.50
+  groq/compound:
+    provider: groq
+    #: An agentic system rather than a bare model: it may call tools itself.
+    #: Priced at the 120b rate until measured.
+    input: 0.15
+    output: 0.75
+    quality: 0.63
 
   # Cerebras
+  # CHECKED 2026-08-15 against inference-docs.cerebras.ai. The catalogue is now
+  # three models: gpt-oss-120b (production), gemma-4-31b (preview), and
+  # zai-glm-4.7, which DEPRECATES 2026-08-17. llama3.1-8b and qwen3 are no
+  # longer published and have been removed.
+  gemma-4-31b:
+    provider: cerebras
+    #: Replaces zai-glm-4.7 as the Cerebras entry. Unmeasured on this gateway.
+    input: 0.10
+    output: 0.10
+    quality: 0.55
   zai-glm-4.7:
     provider: cerebras
+    #: RETIRES 2026-08-17. Kept only so an in-flight run resolves a price.
+    #: Remove after that date; routing should not select it.
+    deprecated_after: "2026-08-17"
     #: FRONTIER rung, second in the ring. MEASURED: 35 in / 86 out, $0.0000605,
     #: 1033 ms. The worst offender for reasoning: with the dial left alone it
     #: burned all 512 output tokens thinking and returned `content: ""` for
@@ -121,11 +177,6 @@ models:
     measured_reference_usd: 0.0000605
     measured_non_empty: true
     measured_needs_reasoning_off: true
-  llama3.1-8b:
-    provider: cerebras
-    input: 0.10
-    output: 0.10
-    quality: 0.30
 
   # NVIDIA NIM — free build tier for the course.
   #
@@ -163,27 +214,6 @@ models:
 
   # GitHub Models — free quota; the rates below are what the same models cost
   # on Azure OpenAI once the quota is gone.
-  openai/gpt-4.1:
-    provider: github
-    #: FRONTIER rung, first in the ring, and the most expensive model this
-    #: gateway can reach. MEASURED: 37 in / 76 out, $0.000682, 2883 ms. Answers
-    #: without any reasoning dial. Context caps at 8k on this surface.
-    input: 2.00
-    output: 8.00
-    cache_read_multiplier: 0.25
-    #: Raised from 0.55. At 0.55 the frontier rung scored BELOW gpt-oss-120b
-    #: (0.60) at a quarter of its price, so any cost/quality objective demoted
-    #: it out of its own rung and the ladder collapsed to one model.
-    quality: 0.72
-    measured_latency_ms: 2883
-    measured_reference_usd: 0.000682
-    measured_non_empty: true
-  openai/gpt-4.1-mini:
-    provider: github
-    input: 0.40
-    output: 1.60
-    cache_read_multiplier: 0.25
-    quality: 0.52
 
   # OpenRouter free tier — CHEAP rung, second in the ring. Priced by name rather
   # than by the `*:free` glob so the ladder's second rung is not a guess.
@@ -224,7 +254,32 @@ models:
 # Not reachable from the default .env, but priced so a deployment that adds an
 # Anthropic/OpenAI provider gets correct dollars with zero code change, and so
 # the cost-per-task lecture has real numbers to compare against.
-  claude-haiku-4.5:
+  # RESTORED 2026-08-15. These are GitHub Models, not OpenAI direct: the
+  # openai/* prefix is the publisher, not the endpoint. OpenAI retired
+  # gpt-4.1 on its own API; GitHub's free catalogue still serves it, and
+  # the FRONTIER measurement below was taken through that surface.
+  openai/gpt-4.1:
+    provider: github
+    #: FRONTIER rung, first in the ring, and the most expensive model this
+    #: gateway can reach. MEASURED: 37 in / 76 out, $0.000682, 2883 ms. Answers
+    #: without any reasoning dial. Context caps at 8k on this surface.
+    input: 2.00
+    output: 8.00
+    cache_read_multiplier: 0.25
+    #: Raised from 0.55. At 0.55 the frontier rung scored BELOW gpt-oss-120b
+    #: (0.60) at a quarter of its price, so any cost/quality objective demoted
+    #: it out of its own rung and the ladder collapsed to one model.
+    quality: 0.72
+    measured_latency_ms: 2883
+    measured_reference_usd: 0.000682
+    measured_non_empty: true
+  openai/gpt-4.1-mini:
+    provider: github
+    input: 0.40
+    output: 1.60
+    cache_read_multiplier: 0.25
+    quality: 0.52
+  claude-haiku-4-5:
     provider: anthropic
     input: 1.00
     output: 5.00

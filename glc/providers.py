@@ -1291,11 +1291,20 @@ def build_providers(cache_store):
 # separate per-call markers. Routers receive a bounded envelope (token_count +
 # 800-char sample) and emit a single word (TINY/LARGE/HUGE).
 ROUTER_DEFAULTS = {
-    # NOTE: On the test Cerebras account, gpt-oss-120b / zai-glm-4.7 / qwen-3-32b
-    # all 404 (no entitlement despite docs). Only llama3.1-8b and the deprecating
-    # qwen-3-235b respond. Using llama3.1-8b — small, fast, the natural router
-    # shape. *** DEPRECATES MAY 27, 2026 *** — must update ROUTER_CEREBRAS_MODEL
-    # before then, OR upgrade the Cerebras account to unlock gpt-oss-120b.
+    # *** UNRESOLVED, CHECKED 2026-08-15. Needs a live call with the real key. ***
+    #
+    # Cerebras now publishes exactly three models: gpt-oss-120b (production),
+    # gemma-4-31b (preview), and zai-glm-4.7, which RETIRES 2026-08-17.
+    # llama3.1-8b — the value below — is no longer in that catalogue.
+    #
+    # But the earlier measurement on this account says the opposite: gpt-oss-120b,
+    # zai-glm-4.7 and qwen-3-32b all 404 with no entitlement, and only llama3.1-8b
+    # answered. Docs and entitlements disagree, and only the key settles it.
+    #
+    # Left as-is deliberately. Switching to gpt-oss-120b on the strength of the
+    # docs would trade a model that works for one that 404s, which is worse than
+    # a model that is merely unlisted. Run the /models endpoint with the real key,
+    # then set this to whatever actually answers.
     "cerebras": "llama3.1-8b",
     "groq": "llama-3.3-70b-versatile",
     "nvidia": "nvidia/llama-3.1-nemotron-nano-8b-v1",
