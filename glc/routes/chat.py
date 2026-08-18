@@ -400,22 +400,19 @@ def _required_caps(req: ChatRequest):
 async def _resolve_image_urls(messages):
     import base64
 
-    import httpx as _httpx
+    from glc.security import ssrf
 
     async def _fetch_to_data_url(url: str) -> str:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; GLCv1/0.1; +image-resolver)",
-            "Accept": "image/*,*/*;q=0.8",
-        }
-        async with _httpx.AsyncClient(timeout=30, follow_redirects=True, headers=headers) as c:
-            try:
-                r = await c.get(url)
-                r.raise_for_status()
-            except _httpx.HTTPError as e:
-                raise HTTPException(400, f"failed to fetch image url {url!r}: {e}")
-            mt = (r.headers.get("content-type") or "image/png").split(";")[0].strip()
-            b64 = base64.b64encode(r.content).decode()
-            return f"data:{mt};base64,{b64}"
+        # Goes through the SSRF guard rather than a bare httpx.get: the URL is
+        # caller-supplied and reaches here from channel adapters that accept
+        # inbound messages from the public internet. The guard rejects
+        # private/loopback/link-local/metadata targets, re-validates every
+        # redirect hop instead of letting httpx follow them blindly, pins the
+        # validated IP at connect so DNS cannot rebind underneath the check,
+        # and caps the body during the download.
+        content, mt = await ssrf.fetch_bytes(url)
+        b64 = base64.b64encode(content).decode()
+        return f"data:{mt};base64,{b64}"
 
     out = []
     for m in messages:
