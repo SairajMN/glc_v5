@@ -444,7 +444,42 @@ async def _resolve_image_urls(messages):
     return out
 
 
+MAX_SCHEMA_DEPTH = 40
+MAX_SCHEMA_NODES = 5000
+
+
+def assert_schema_sane(schema: Any, _depth: int = 0, _counter: list[int] | None = None) -> None:
+    """Bound a caller-supplied JSON Schema before it reaches the validator.
+
+    ``response_format.schema`` comes off the wire, and Draft202012Validator
+    will happily recurse or blow up compiling a hostile one. Walk it once with
+    a depth cap and a node-count cap and reject anything past the limits, so
+    validation always terminates.
+    """
+    if _counter is None:
+        _counter = [0]
+    if _depth > MAX_SCHEMA_DEPTH:
+        raise HTTPException(400, "response_format.schema too deeply nested")
+    _counter[0] += 1
+    if _counter[0] > MAX_SCHEMA_NODES:
+        raise HTTPException(400, "response_format.schema too large")
+    if isinstance(schema, dict):
+        # The depth and node caps only bound schemas that are *structurally*
+        # large. A $ref pointing back at the document root is small enough to
+        # clear both and still recurse the validator until the interpreter
+        # dies, so the pointer has to be rejected by value.
+        ref = schema.get("$ref")
+        if isinstance(ref, str) and ref.strip() in ("#", "#/"):
+            raise HTTPException(400, "response_format.schema contains a self-referential $ref")
+        for v in schema.values():
+            assert_schema_sane(v, _depth + 1, _counter)
+    elif isinstance(schema, list):
+        for v in schema:
+            assert_schema_sane(v, _depth + 1, _counter)
+
+
 def _validate_structured(text: str, schema: dict):
+    assert_schema_sane(schema)
     try:
         obj = json.loads(text)
     except Exception as e:
