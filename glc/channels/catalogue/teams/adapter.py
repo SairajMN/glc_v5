@@ -14,8 +14,8 @@ Key wire-format facts from the Bot Framework docs:
 
 from __future__ import annotations
 
-import os
 import logging
+import os
 import re
 import time
 from datetime import UTC, datetime

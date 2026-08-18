@@ -61,7 +61,7 @@ async def test_distinct_requests_still_pass():
 async def test_forged_signature_still_rejected():
     adapter = Adapter(config={})
     bad = _signed({"text": "hi", "sender_id": "u-1", "sender_handle": "someone"})
-    bad["headers"]["X-Webhook-Signature"] = "t=%d,v1=deadbeef" % int(time.time())
+    bad["headers"]["X-Webhook-Signature"] = f"t={int(time.time())},v1=deadbeef"
     assert await adapter.on_message(bad) is None
 
 
