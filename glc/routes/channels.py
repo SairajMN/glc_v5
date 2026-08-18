@@ -26,12 +26,68 @@ from glc.channels import registry
 from glc.channels.agent_bridge import AgentBridgeError
 from glc.channels.envelope import ChannelMessage, ChannelReply
 from glc.channels.setup import CHANNEL_SPECS, public_catalogue, update
-from glc.config import get_or_create_install_token
+from glc.config import get_or_create_install_token, load_channels
 from glc.security.allowlists import allowed
 from glc.security.pairing import get_pairing_store
 from glc.security.rate_limits import get_rate_limiter
 
 router = APIRouter()
+
+
+def _channel_cfg(name: str) -> tuple[dict, dict]:
+    cfg = load_channels() or {}
+    return (cfg.get("defaults") or {}), ((cfg.get("channels") or {}).get(name) or {})
+
+
+def _derive_gate(name: str, env: ChannelMessage) -> tuple[bool, bool]:
+    """Return the (is_public_channel, was_mentioned) pair to gate on.
+
+    Both values used to be read straight out of ``env.metadata``, which the
+    caller controls. In ``allowed()`` they only ever make the check stricter,
+    so the caller's lever is to *weaken* it: claim ``is_public_channel=False``
+    and the public-channel mention requirement never applies, or claim
+    ``was_mentioned=True`` and it is satisfied without a mention.
+
+    So neither claim may relax the gate:
+
+    * ``is_public`` is true if the config says so OR the caller admits it.
+      Admitting a public channel is only ever stricter, so it is safe to
+      honour; denying one is not, so config wins.
+    * ``was_mentioned`` is derived from the channel's ``mention_tokens`` when
+      any are configured, and the caller's claim is ignored outright. Where no
+      tokens are configured there is nothing to verify against, so the claim
+      is used as before rather than hard-denying a working channel. Configure
+      ``mention_tokens`` to close that last gap.
+    """
+    defaults, ch = _channel_cfg(name)
+    md = env.metadata or {}
+    claimed_public = bool(md.get("is_public_channel", False))
+    claimed_mention = bool(md.get("was_mentioned", False))
+
+    configured_public = bool(ch.get("is_public", defaults.get("is_public", False)))
+    is_public = configured_public or claimed_public
+
+    tokens = ch.get("mention_tokens", defaults.get("mention_tokens", [])) or []
+    if tokens:
+        text = env.text or ""
+        was_mentioned = any(tok and tok in text for tok in tokens)
+    else:
+        was_mentioned = claimed_mention
+
+    if tokens and claimed_mention != was_mentioned:
+        audit_append(
+            channel=name,
+            channel_user_id=env.channel_user_id,
+            trust_level=env.trust_level,
+            event_type="mention_claim_ignored",
+            result={
+                "claimed_was_mentioned": claimed_mention,
+                "server_was_mentioned": was_mentioned,
+                "claimed_is_public_channel": claimed_public,
+                "server_is_public_channel": is_public,
+            },
+        )
+    return is_public, was_mentioned
 
 
 class ChannelSettingsUpdate(BaseModel):
@@ -106,12 +162,13 @@ async def channel_ws(websocket: WebSocket, name: str, token: str | None = Query(
                 continue
             env = _verified_identity(env, pairings)
 
+            gate_public, gate_mentioned = _derive_gate(env.channel, env)
             ok, why = allowed(
                 env.channel,
                 env.channel_user_id,
                 owner_ids=owners,
-                is_public_channel=bool(env.metadata.get("is_public_channel", False)),
-                was_mentioned=bool(env.metadata.get("was_mentioned", False)),
+                is_public_channel=gate_public,
+                was_mentioned=gate_mentioned,
             )
             if not ok:
                 audit_append(
@@ -198,12 +255,13 @@ async def channel_webhook(name: str, request: Request):
     msg = _verified_identity(msg, pairings)
     owners = [p.channel_user_id for p in pairings.owners(channel=name)]
 
+    gate_public, gate_mentioned = _derive_gate(msg.channel, msg)
     ok, why = allowed(
         msg.channel,
         msg.channel_user_id,
         owner_ids=owners,
-        is_public_channel=bool(msg.metadata.get("is_public_channel", False)),
-        was_mentioned=bool(msg.metadata.get("was_mentioned", False)),
+        is_public_channel=gate_public,
+        was_mentioned=gate_mentioned,
     )
     if not ok:
         audit_append(

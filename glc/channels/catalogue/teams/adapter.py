@@ -14,11 +14,13 @@ Key wire-format facts from the Bot Framework docs:
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import time
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlparse
 
 from glc.channels.base import ChannelAdapter
 from glc.channels.catalogue.teams.schemas import ADAPTIVE_CARD_CONTENT_TYPE
@@ -27,9 +29,36 @@ from glc.security.allowlists import allowed
 from glc.security.pairing import get_pairing_store
 from glc.security.trust_level import classify
 
+_log = logging.getLogger(__name__)
+
 _MENTION_RE = re.compile(r"<at>[^<]*</at>\s*")
 
 _TOKEN_CACHE: dict[str, tuple[str, float]] = {}  # app_id -> (token, expires_at)
+
+# serviceUrl arrives inside the inbound Activity, which is attacker-supplied
+# until proven otherwise, and send() POSTs a live bearer token to it. That
+# makes it a target we must never write a credential to unless it really is
+# Microsoft. Suffix match so regional subdomains (smba.trafficmanager.net,
+# *.botframework.com) are covered.
+_DEFAULT_ALLOWED_SERVICE_HOSTS: tuple[str, ...] = (
+    "botframework.com",
+    "smba.trafficmanager.net",
+)
+
+
+def _service_url_allowed(url: str, allowed_hosts: tuple[str, ...]) -> bool:
+    """True if ``url``'s host is (a subdomain of) an allowlisted host, over
+    https. Fail closed on anything unparsable or off-scheme."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme != "https":
+        return False
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False
+    return any(host == h or host.endswith("." + h) for h in allowed_hosts)
 
 
 def _bfs_first_textblock(card: dict[str, Any]) -> str | None:
@@ -96,6 +125,9 @@ class Adapter(ChannelAdapter):
         super().__init__(config)
         # serviceUrl + conversation_id per sender; needed to address real replies.
         self._conv_cache: dict[str, dict[str, str]] = {}
+        self._allowed_service_hosts: tuple[str, ...] = tuple(
+            self.config.get("allowed_service_url_hosts") or _DEFAULT_ALLOWED_SERVICE_HOSTS
+        )
 
     async def on_message(self, raw: Any) -> ChannelMessage | None:  # type: ignore[override]
         mock = self.config.get("mock")
@@ -145,11 +177,18 @@ class Adapter(ChannelAdapter):
                     text = _bfs_first_textblock(card)
                 break  # first adaptive card wins
 
-        # Cache conversation context for outbound replies.
-        self._conv_cache[user_id] = {
-            "service_url": service_url,
-            "conversation_id": conversation_id,
-        }
+        # Cache conversation context for outbound replies, but only for a
+        # serviceUrl that really belongs to Bot Framework. send() POSTs a live
+        # bearer token to this host, so a forged Activity naming an attacker's
+        # URL would hand them the credential. A rejected serviceUrl simply is
+        # not cached, so send() fails closed with "no cached context".
+        if service_url and _service_url_allowed(service_url, self._allowed_service_hosts):
+            self._conv_cache[user_id] = {
+                "service_url": service_url,
+                "conversation_id": conversation_id,
+            }
+        elif service_url:
+            _log.warning("teams: refusing to cache non-allowlisted serviceUrl for %s", user_id)
 
         ts_raw: str | None = raw.get("timestamp")
         arrived_at = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")) if ts_raw else datetime.now(UTC)
@@ -184,6 +223,14 @@ class Adapter(ChannelAdapter):
             raise RuntimeError(
                 f"no cached context for {reply.channel_user_id!r}; "
                 "call on_message for this user before send()"
+            )
+
+        # Checked again at the point of use, not only when caching. The token
+        # is minted just below, so this is the last gate before a credential
+        # leaves the process.
+        if not _service_url_allowed(ctx["service_url"], self._allowed_service_hosts):
+            raise RuntimeError(
+                f"teams: refusing to send to non-allowlisted serviceUrl {ctx['service_url']!r}"
             )
 
         import httpx
