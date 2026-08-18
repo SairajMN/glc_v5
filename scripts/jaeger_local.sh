@@ -63,12 +63,34 @@ status() {
 
 case "${1:-run}" in
   --stop)
-    [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null || true
-    rm -f "$PIDFILE"; echo "stopped" ;;
+    if [ -f "$PIDFILE" ]; then
+      pid="$(cat "$PIDFILE")"
+      kill "$pid" 2>/dev/null || true
+      for _ in $(seq 1 10); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+      if kill -0 "$pid" 2>/dev/null; then kill -9 "$pid" 2>/dev/null || true; sleep 1; fi
+      rm -f "$PIDFILE"
+    fi
+    # Never report success on the strength of the pidfile alone. A pidfile naming
+    # the wrong process lets "stopped" print while Jaeger keeps holding 16686/4317/
+    # 4318 — which then blocks the Docker path with a confusing port conflict. The
+    # port answering is the only evidence that counts.
+    if curl -fsS --max-time 3 "http://localhost:$UI_PORT/api/services" >/dev/null 2>&1; then
+      echo "still serving on port $UI_PORT — not stopped" >&2
+      command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$UI_PORT" -sTCP:LISTEN >&2 || true
+      exit 1
+    fi
+    echo "stopped" ;;
   --status) status ;;
   --start)
     fetch
-    ( cd "$PREFIX/$NAME" && nohup ./jaeger >"$LOG" 2>&1 & echo $! >"$PIDFILE" )
+    # `cmd1 && cmd2 &` backgrounds the whole && list, so $! recorded the pid of the
+    # subshell running that list, not Jaeger's. The subshell stays alive as Jaeger's
+    # parent, so --stop killed the parent, succeeded, and left Jaeger orphaned under
+    # PID 1 with all three ports still bound. Background the subshell explicitly and
+    # `exec` into it: exec replaces the subshell, nohup execs in turn, so the pid $!
+    # records is Jaeger's own.
+    ( cd "$PREFIX/$NAME" && exec nohup ./jaeger >"$LOG" 2>&1 ) &
+    echo $! >"$PIDFILE"
     for _ in $(seq 1 30); do sleep 1; status >/dev/null 2>&1 && break; done
     status || { echo "--- last 20 log lines"; tail -20 "$LOG"; exit 1; } ;;
   *)

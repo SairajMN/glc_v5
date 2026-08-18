@@ -25,7 +25,9 @@
 
 services:
   jaeger:
-    image: jaegertracing/all-in-one:2.20.0
+    # v2's all-in-one ships as jaegertracing/jaeger. The old jaegertracing/all-in-one
+    # repo stopped at 1.76.0 — a 2.x tag there does not exist and never will.
+    image: jaegertracing/jaeger:2.20.0
     container_name: glc-jaeger
     restart: unless-stopped
     ports:
