@@ -115,7 +115,15 @@ router = APIRouter()
 
 
 def _estimate_tokens(text: str) -> int:
-    return int(len(text.split()) * 1.4)
+    """Size a request for the router's HUGE admission gate.
+
+    Whitespace word count alone collapses on input that has no spaces: 40k
+    CJK characters, a base64 blob or one concatenated run all score as a
+    single word, estimate as ~1 token, and sail past the ``> 8000 -> HUGE``
+    gate into a small-context model. The character floor is what the rest of
+    this module already uses for sizing, so take whichever is larger.
+    """
+    return max(int(len(text.split()) * 1.4), len(text) // 4)
 
 
 def _build_sample(text: str) -> str:
@@ -261,14 +269,45 @@ def _system_blocks(req: ChatRequest):
     return [b.model_dump() if hasattr(b, "model_dump") else b for b in req.system]
 
 
+def _image_block_charcost(b: dict) -> int:
+    """Char-equivalent cost of an image block, from its ACTUAL payload size.
+
+    A flat per-image constant is what the router's only context hard gate
+    sizes images by, so a multi-megabyte inline image scores the same ~300
+    tokens as a thumbnail and clears ``max_ctx`` for every provider, while an
+    equally large text body is correctly rejected. Base64 inflates roughly
+    4/3, so scale back to the decoded length. The floor keeps small images
+    from scoring zero and preserves the previous behaviour for them.
+    """
+    payload_len = 0
+    btype = b.get("type")
+    if btype == "image_url":
+        iu = b.get("image_url")
+        url = iu.get("url") if isinstance(iu, dict) else iu
+        if isinstance(url, str):
+            payload_len = len(url)
+    elif btype in ("image", "input_image"):
+        src = b.get("source") or {}
+        if isinstance(src, dict) and src.get("data"):
+            payload_len = len(str(src.get("data")))
+        else:
+            url = b.get("url") or (src.get("url") if isinstance(src, dict) else None)
+            if isinstance(url, str):
+                payload_len = len(url)
+    decoded_bytes = int(payload_len * 3 / 4)
+    return max(1200, decoded_bytes)
+
+
 def _est_tokens(messages, system_blocks, max_tokens):
     chars = 0
     for m in messages:
         c = m.get("content", "")
         if isinstance(c, list):
             chars += len(P._extract_text_blocks(c))
-            chars += 1200 * sum(
-                1 for b in c if isinstance(b, dict) and b.get("type") in ("image_url", "image", "input_image")
+            chars += sum(
+                _image_block_charcost(b)
+                for b in c
+                if isinstance(b, dict) and b.get("type") in ("image_url", "image", "input_image")
             )
         else:
             chars += len(str(c))
