@@ -115,7 +115,15 @@ router = APIRouter()
 
 
 def _estimate_tokens(text: str) -> int:
-    return int(len(text.split()) * 1.4)
+    """Size a request for the router's HUGE admission gate.
+
+    Whitespace word count alone collapses on input that has no spaces: 40k
+    CJK characters, a base64 blob or one concatenated run all score as a
+    single word, estimate as ~1 token, and sail past the ``> 8000 -> HUGE``
+    gate into a small-context model. The character floor is what the rest of
+    this module already uses for sizing, so take whichever is larger.
+    """
+    return max(int(len(text.split()) * 1.4), len(text) // 4)
 
 
 def _build_sample(text: str) -> str:
@@ -261,14 +269,45 @@ def _system_blocks(req: ChatRequest):
     return [b.model_dump() if hasattr(b, "model_dump") else b for b in req.system]
 
 
+def _image_block_charcost(b: dict) -> int:
+    """Char-equivalent cost of an image block, from its ACTUAL payload size.
+
+    A flat per-image constant is what the router's only context hard gate
+    sizes images by, so a multi-megabyte inline image scores the same ~300
+    tokens as a thumbnail and clears ``max_ctx`` for every provider, while an
+    equally large text body is correctly rejected. Base64 inflates roughly
+    4/3, so scale back to the decoded length. The floor keeps small images
+    from scoring zero and preserves the previous behaviour for them.
+    """
+    payload_len = 0
+    btype = b.get("type")
+    if btype == "image_url":
+        iu = b.get("image_url")
+        url = iu.get("url") if isinstance(iu, dict) else iu
+        if isinstance(url, str):
+            payload_len = len(url)
+    elif btype in ("image", "input_image"):
+        src = b.get("source") or {}
+        if isinstance(src, dict) and src.get("data"):
+            payload_len = len(str(src.get("data")))
+        else:
+            url = b.get("url") or (src.get("url") if isinstance(src, dict) else None)
+            if isinstance(url, str):
+                payload_len = len(url)
+    decoded_bytes = int(payload_len * 3 / 4)
+    return max(1200, decoded_bytes)
+
+
 def _est_tokens(messages, system_blocks, max_tokens):
     chars = 0
     for m in messages:
         c = m.get("content", "")
         if isinstance(c, list):
             chars += len(P._extract_text_blocks(c))
-            chars += 1200 * sum(
-                1 for b in c if isinstance(b, dict) and b.get("type") in ("image_url", "image", "input_image")
+            chars += sum(
+                _image_block_charcost(b)
+                for b in c
+                if isinstance(b, dict) and b.get("type") in ("image_url", "image", "input_image")
             )
         else:
             chars += len(str(c))
@@ -361,22 +400,19 @@ def _required_caps(req: ChatRequest):
 async def _resolve_image_urls(messages):
     import base64
 
-    import httpx as _httpx
+    from glc.security import ssrf
 
     async def _fetch_to_data_url(url: str) -> str:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; GLCv1/0.1; +image-resolver)",
-            "Accept": "image/*,*/*;q=0.8",
-        }
-        async with _httpx.AsyncClient(timeout=30, follow_redirects=True, headers=headers) as c:
-            try:
-                r = await c.get(url)
-                r.raise_for_status()
-            except _httpx.HTTPError as e:
-                raise HTTPException(400, f"failed to fetch image url {url!r}: {e}")
-            mt = (r.headers.get("content-type") or "image/png").split(";")[0].strip()
-            b64 = base64.b64encode(r.content).decode()
-            return f"data:{mt};base64,{b64}"
+        # Goes through the SSRF guard rather than a bare httpx.get: the URL is
+        # caller-supplied and reaches here from channel adapters that accept
+        # inbound messages from the public internet. The guard rejects
+        # private/loopback/link-local/metadata targets, re-validates every
+        # redirect hop instead of letting httpx follow them blindly, pins the
+        # validated IP at connect so DNS cannot rebind underneath the check,
+        # and caps the body during the download.
+        content, mt = await ssrf.fetch_bytes(url)
+        b64 = base64.b64encode(content).decode()
+        return f"data:{mt};base64,{b64}"
 
     out = []
     for m in messages:
@@ -405,7 +441,42 @@ async def _resolve_image_urls(messages):
     return out
 
 
+MAX_SCHEMA_DEPTH = 40
+MAX_SCHEMA_NODES = 5000
+
+
+def assert_schema_sane(schema: Any, _depth: int = 0, _counter: list[int] | None = None) -> None:
+    """Bound a caller-supplied JSON Schema before it reaches the validator.
+
+    ``response_format.schema`` comes off the wire, and Draft202012Validator
+    will happily recurse or blow up compiling a hostile one. Walk it once with
+    a depth cap and a node-count cap and reject anything past the limits, so
+    validation always terminates.
+    """
+    if _counter is None:
+        _counter = [0]
+    if _depth > MAX_SCHEMA_DEPTH:
+        raise HTTPException(400, "response_format.schema too deeply nested")
+    _counter[0] += 1
+    if _counter[0] > MAX_SCHEMA_NODES:
+        raise HTTPException(400, "response_format.schema too large")
+    if isinstance(schema, dict):
+        # The depth and node caps only bound schemas that are *structurally*
+        # large. A $ref pointing back at the document root is small enough to
+        # clear both and still recurse the validator until the interpreter
+        # dies, so the pointer has to be rejected by value.
+        ref = schema.get("$ref")
+        if isinstance(ref, str) and ref.strip() in ("#", "#/"):
+            raise HTTPException(400, "response_format.schema contains a self-referential $ref")
+        for v in schema.values():
+            assert_schema_sane(v, _depth + 1, _counter)
+    elif isinstance(schema, list):
+        for v in schema:
+            assert_schema_sane(v, _depth + 1, _counter)
+
+
 def _validate_structured(text: str, schema: dict):
+    assert_schema_sane(schema)
     try:
         obj = json.loads(text)
     except Exception as e:

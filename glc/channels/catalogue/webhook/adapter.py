@@ -26,11 +26,44 @@ from glc.security.trust_level import classify
 REPLAY_WINDOW_SECONDS = 300
 
 
+class _SeenSignatures:
+    """Remember accepted signatures for as long as they could be replayed.
+
+    The freshness check bounds *how long* a captured request stays useful; it
+    does nothing about how many times it may be used inside that window. A
+    valid body and signature could therefore be replayed repeatedly for five
+    minutes, each replay producing another inbound message, another model
+    call, another reply and another entry in the cost ledger.
+
+    Entries are only useful until the freshness check would reject them on its
+    own, so the store is swept against the same horizon and cannot grow
+    without bound.
+    """
+
+    def __init__(self, ttl_seconds: int = REPLAY_WINDOW_SECONDS) -> None:
+        self._ttl = ttl_seconds
+        self._seen: dict[str, float] = {}
+
+    def check_and_record(self, signature: str, now: float) -> bool:
+        """True if this signature is new. False means it is a replay."""
+        for sig, at in list(self._seen.items()):
+            if now - at > self._ttl:
+                del self._seen[sig]
+        if signature in self._seen:
+            return False
+        self._seen[signature] = now
+        return True
+
+
 class Adapter(ChannelAdapter):
     name = "webhook"
 
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        super().__init__(config)
+        self._seen_signatures = _SeenSignatures()
+
     def _verify(self, raw_body: bytes, headers: dict[str, str]) -> bool:
-        """True only if the signature is valid AND the timestamp is fresh."""
+        """True only if the signature is valid, fresh, and not already used."""
         secret = os.getenv("WEBHOOK_SHARED_SECRET")
         if not secret:
             return False
@@ -48,7 +81,12 @@ class Adapter(ChannelAdapter):
             return False
         signed = f"{ts}.{raw_body.decode('utf-8', 'replace')}".encode()
         expected = hmac.new(secret.encode(), signed, sha256).hexdigest()
-        return hmac.compare_digest(expected, received)
+        if not hmac.compare_digest(expected, received):
+            return False
+        # Only recorded once the signature is known good, so an attacker
+        # cannot fill the store with garbage, and a rejected forgery does not
+        # consume the identifier of a request that never arrived.
+        return self._seen_signatures.check_and_record(f"{ts}.{received}", time.time())
 
     async def on_message(self, raw: Any) -> ChannelMessage:
         mock = self.config.get("mock")

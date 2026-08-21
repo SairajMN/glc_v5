@@ -47,6 +47,10 @@ from glc.voice.stt.providers.gemini_live.schemas import (
     GeminiLiveTextPart,
 )
 
+# Upper bound on a single inbound WebSocket frame. The TTS sibling adapter
+# keeps the websockets default; this one had opted out of any cap at all.
+_WS_MAX_FRAME_BYTES = 16 * 1024 * 1024
+
 
 class Provider(STTProvider):
     name = "gemini_live"
@@ -173,7 +177,12 @@ class Provider(STTProvider):
             ssl_ctx.verify_mode = ssl.CERT_NONE
 
         try:
-            async with websockets.connect(url, max_size=None, ssl=ssl_ctx) as ws:
+            # max_size=None disables the library's frame cap entirely, so a
+            # misbehaving upstream (or anything intercepting the connection)
+            # can hand us a frame large enough to exhaust memory. The
+            # transcript frames this reads are small; 16 MiB is far above any
+            # legitimate one and still bounded.
+            async with websockets.connect(url, max_size=_WS_MAX_FRAME_BYTES, ssl=ssl_ctx) as ws:
                 # 1. setup must be the first frame
                 await ws.send(json.dumps(self._build_setup_frame()))
                 # 2. push the audio, then close the input turn
